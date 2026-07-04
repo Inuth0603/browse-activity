@@ -20,101 +20,62 @@ from gi.repository import GObject
 from gi.repository import Gtk
 from gi.repository import Gdk
 
-from sugar3.graphics.icon import Icon, EventIcon
-from sugar3.graphics.tray import HTray
-from sugar3.graphics import style
-from sugar3.graphics.xocolor import XoColor
-from sugar3.graphics.palette import Palette
+from sugar4.graphics.icon import Icon, EventIcon
+from sugar4.graphics.tray import HTray
+from sugar4.graphics import style
+from sugar4.graphics.xocolor import XoColor
 
 
-class TabAdd(Gtk.HBox):
+class TabAdd(Gtk.Box):
     __gtype_name__ = 'BrowseTabAdd'
 
-    tab_added = GObject.Signal('tab-added', arg_types=[str])
+    tab_added = GObject.Signal('tab-added', arg_types=[object])
 
     def __init__(self):
-        GObject.GObject.__init__(self)
+        Gtk.Box.__init__(self, orientation=Gtk.Orientation.HORIZONTAL)
 
         add_tab_icon = Icon(icon_name='add')
         button = Gtk.Button()
-        button.drag_dest_set(0, [], 0)
-        button.props.relief = Gtk.ReliefStyle.NONE
-        button.props.focus_on_click = False
-        icon_box = Gtk.HBox()
-        icon_box.pack_start(add_tab_icon, True, False, 0)
-        button.add(icon_box)
+        drop_target = Gtk.DropTarget.new(
+            GObject.TYPE_STRING, Gdk.DragAction.COPY)
+        drop_target.connect('drop', self.__on_drop)
+        button.add_controller(drop_target)
+        button.set_has_frame(False)
+        button.set_focus_on_click(False)
+        icon_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        icon_box.append(add_tab_icon)
+        button.set_child(icon_box)
         button.connect('clicked', self.__button_clicked_cb)
-        button.connect('drag-data-received', self.__drag_cb)
-        button.connect('drag-motion', self.__drag_motion_cb)
-        button.connect('drag-drop', self.__drag_drop_cb)
         button.set_name('browse-tab-add')
-        self.pack_start(button, True, True, 0)
-        add_tab_icon.show()
-        icon_box.show()
-        button.show()
+        button.set_hexpand(True)
+        self.append(button)
 
-    def __drag_motion_cb(self, widget, context, x, y, time):
-        Gdk.drag_status(context, Gdk.DragAction.MOVE, time)
-        return True
-
-    def __drag_drop_cb(self, widget, context, x, y, time):
-        context_targets = context.list_targets()
-        for target in context_targets:
-            if str(target) not in ('TIMESTAMP', 'TARGETS', 'MULTIPLE'):
-                widget.drag_get_data(context, target, time)
-        return True
-
-    def __drag_cb(self, widget, drag_context, x, y, data, info, time):
-        uris = data.get_uris()
-        for uri in uris:
-            self.tab_added.emit(uri)
+    def __on_drop(self, target, value, x, y):
+        if isinstance(value, str):
+            for uri in value.splitlines():
+                uri = uri.strip()
+                if uri:
+                    self.tab_added.emit(uri)
+            return True
+        return False
 
     def __button_clicked_cb(self, button):
         self.tab_added.emit(None)
 
 
 class BrowserNotebook(Gtk.Notebook):
+    """Handle an extra tab at the end with an Add Tab button."""
     __gtype_name__ = 'BrowseNotebook'
 
-    """Handle an extra tab at the end with an Add Tab button."""
-
     def __init__(self):
-        GObject.GObject.__init__(self)
+        super().__init__()
 
         tab_add = TabAdd()
         tab_add.connect('tab-added', self.on_add_tab)
         self.set_action_widget(tab_add, Gtk.PackType.END)
-        tab_add.show()
 
     def on_add_tab(self, obj, uri):
         raise NotImplementedError("implement this in the subclass")
-
-
-screen = Gdk.Screen.get_default()
-css_provider = Gtk.CssProvider.get_default()
-css = ('''
-@define-color button_grey #808080;
-
-.TitledTray-top-bar {{
-    color: white;
-    background: @button_grey;
-    min-height: {cell2over5}px;
-}}
-.TitledTray-top-bar label {{
-    color: white;
-}}
-'''.format(
-    cell2over5=(style.GRID_CELL_SIZE * 2) / 5
-))
-
-try:
-    css_provider.load_from_data(css)
-except BaseException:
-    pass  # Gtk+ 3.18.9 does not have min-height
-
-context = Gtk.StyleContext()
-context.add_provider_for_screen(screen, css_provider,
-                                Gtk.STYLE_PROVIDER_PRIORITY_USER)
 
 
 class TitledTray(Gtk.Box):
@@ -123,45 +84,61 @@ class TitledTray(Gtk.Box):
 
     Args:
         title (str): title of the tray
+
+    Attributes:
+        tray (HTray): The underlying horizontal tray widget for holding items.
     '''
 
     def __init__(self, title):
         Gtk.Box.__init__(self, orientation=Gtk.Orientation.VERTICAL)
 
-        self._top_event_box = Gtk.EventBox()
-        self._top_event_box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK |
-                                       Gdk.EventMask.TOUCH_MASK |
-                                       Gdk.EventMask.BUTTON_RELEASE_MASK)
-        self.add(self._top_event_box)
-        self._top_event_box.connect('button-release-event',
-                                    self.__top_event_box_release_cb)
-        self._top_event_box.show()
+        self._top_event_box = Gtk.Box()
+        click_gesture = Gtk.GestureClick.new()
+        click_gesture.connect('released', self.__top_event_box_release_cb)
+        self._top_event_box.add_controller(click_gesture)
+        self.append(self._top_event_box)
 
         self._top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
-                                halign=Gtk.Align.CENTER)
-        self._top_bar.get_style_context().add_class('TitledTray-top-bar')
-        self._top_bar.set_size_request(-1, (style.GRID_CELL_SIZE * 3) / 5)
-        self._top_event_box.add(self._top_bar)
-        self._top_bar.show()
+                                halign=Gtk.Align.CENTER,
+                                hexpand=True)
+        self._top_bar.add_css_class('TitledTray-top-bar')
+
+        # Inject scoped CSS using toolkit helper (uses PRIORITY_APPLICATION
+        # instead of PRIORITY_USER).
+        # Silently swallows CSS parsing errors per toolkit helper design, but
+        # cleanly scopes to widget.
+        css = f"""
+        .TitledTray-top-bar {{
+            color: white;
+            background: {style.COLOR_BUTTON_GREY.get_css_rgba()};
+            min-height: {int((style.GRID_CELL_SIZE * 2) / 5)}px;
+        }}
+        .TitledTray-top-bar label {{
+            color: white;
+        }}
+        """
+        style.apply_css_to_widget(self._top_bar, css)
+        # NOTE: CSS .TitledTray-top-bar min-height is 2/5 of GRID_CELL_SIZE,
+        # but this set_size_request uses 3/5. The larger value here takes
+        # precedence for layout to maintain the correct visual proportions.
+        self._top_bar.set_size_request(-1, int((style.GRID_CELL_SIZE * 3) / 5))
+        self._top_event_box.append(self._top_bar)
 
         self._title = Gtk.Label(label=title)
-        self._top_bar.add(self._title)
-        self._title.show()
+        self._top_bar.append(self._title)
 
         self._hide = self.add_button('go-down', 'Hide')
         self._show = self.add_button('go-up', 'Show')
         self._show.hide()
 
         self._revealer = Gtk.Revealer(reveal_child=True)
-        self.add(self._revealer)
-        self._revealer.show()
+        self.append(self._revealer)
         self.tray = HTray()
-        self._revealer.add(self.tray)
-        self.tray.show()
+        self._revealer.set_child(self.tray)
 
-    def __top_event_box_release_cb(self, widget, event):
-        alloc = widget.get_allocation()
-        if 0 < event.x < alloc.width and 0 < event.y < alloc.height:
+    def __top_event_box_release_cb(self, gesture, n_press, x, y):
+        if 0 < x < self._top_event_box.get_width(
+        ) and 0 < y < self._top_event_box.get_height():
             self.toggle_expanded()
 
     def toggle_expanded(self):
@@ -176,16 +153,11 @@ class TitledTray(Gtk.Box):
 
     def add_button(self, icon_name, description, clicked_cb=None):
         icon = EventIcon(icon_name=icon_name,
-                         pixel_size=(style.GRID_CELL_SIZE * 2) / 5,
+                         pixel_size=int((style.GRID_CELL_SIZE * 2) / 5),
                          xo_color=XoColor('#ffffff,#ffffff'))
-        icon.props.palette = Palette(description)
-        self._top_bar.add(icon)
+        icon.set_tooltip(description)
+        self._top_bar.append(icon)
 
         if clicked_cb:
-            def closure(widget, event):
-                alloc = widget.get_allocation()
-                if 0 < event.x < alloc.width and 0 < event.y < alloc.height:
-                    clicked_cb(widget)
-            icon.connect('button-release-event', closure)
-        icon.show()
+            icon.connect('clicked', lambda icon: clicked_cb(icon))
         return icon

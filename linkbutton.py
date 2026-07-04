@@ -18,20 +18,22 @@
 from gi.repository import Gtk
 from gi.repository import Gdk
 from gi.repository import GObject
+from gi.repository import GLib
 from gi.repository import Rsvg
 
 import os
 import io
 import cairo
+import logging
 from gettext import gettext as _
 import re
 
-from sugar3.graphics.palettemenu import PaletteMenuItemSeparator
-from sugar3.graphics.palettemenu import PaletteMenuItem
-from sugar3.graphics.palettemenu import PaletteMenuBox
-from sugar3.graphics.palette import Palette
-from sugar3.graphics.tray import TrayButton
-from sugar3.graphics import style
+from sugar4.graphics.palettemenu import PaletteMenuItemSeparator
+from sugar4.graphics.palettemenu import PaletteMenuItem
+from sugar4.graphics.palettemenu import PaletteMenuBox
+from sugar4.graphics.palette import Palette
+from sugar4.graphics.tray import TrayButton
+from sugar4.graphics import style
 
 
 class LinkButton(TrayButton, GObject.GObject):
@@ -57,49 +59,81 @@ class LinkButton(TrayButton, GObject.GObject):
         info = title + '\n' + owner
         self.setup_rollover_options(info)
 
-    def get_image_coords(self, relative_to):
-        return self._img.translate_coordinates(
-            relative_to, self._dest_x, self._dest_y)
-
     def show_thumb(self):
-        self._img.set_from_pixbuf(self._pixbuf_bg)
+        if getattr(self, '_texture_bg', None) is not None:
+            self._img.set_paintable(self._texture_bg)
 
     def hide_thumb(self):
-        xo_buddy = os.path.join(os.path.dirname(__file__), "icons/link.svg")
-        bg_surface = self._read_link_background(xo_buddy)
-        bg_width, bg_height = style.zoom(120), style.zoom(110)
-        pixbuf = Gdk.pixbuf_get_from_surface(bg_surface, 0, 0,
-                                             bg_width, bg_height)
-        self._img.set_from_pixbuf(pixbuf)
+        if not hasattr(self, '_texture_hidden_bg'):
+            self._texture_hidden_bg = None
+            xo_buddy = os.path.join(
+                os.path.dirname(__file__), "icons/link.svg")
+            bg_surface = self._read_link_background(xo_buddy)
+
+            if bg_surface:
+                stream = io.BytesIO()
+                bg_surface.write_to_png(stream)
+                png_bytes = GLib.Bytes.new(stream.getvalue())
+                try:
+                    self._texture_hidden_bg = Gdk.Texture.new_from_bytes(
+                        png_bytes)
+                except Exception as e:
+                    logging.error(
+                        'Failed to load hidden background texture: %s', e)
+
+        if self._texture_hidden_bg is not None:
+            self._img.set_paintable(self._texture_hidden_bg)
 
     def set_image(self, buf):
-        self._img = Gtk.Image()
+        self._img = Gtk.Picture()
         str_buf = io.BytesIO(buf)
-        thumb_surface = cairo.ImageSurface.create_from_png(str_buf)
+        try:
+            thumb_surface = cairo.ImageSurface.create_from_png(str_buf)
+        except Exception as e:
+            logging.error(
+                'Failed to create ImageSurface from thumbnail bytes: %s', e)
+            thumb_surface = None
 
         xo_buddy = os.path.join(os.path.dirname(__file__), "icons/link.svg")
 
         bg_surface = self._read_link_background(xo_buddy)
 
-        cairo_context = cairo.Context(bg_surface)
-        cairo_context.set_source_surface(thumb_surface,
-                                         self._dest_x, self._dest_y)
-        thumb_width, thumb_height = style.zoom(100), style.zoom(80)
-        cairo_context.rectangle(self._dest_x, self._dest_y,
-                                thumb_width, thumb_height)
-        cairo_context.fill()
-
         bg_width, bg_height = style.zoom(120), style.zoom(110)
-        self._pixbuf_bg = Gdk.pixbuf_get_from_surface(bg_surface, 0, 0,
-                                                      bg_width, bg_height)
-        self._img.set_from_pixbuf(self._pixbuf_bg)
+
+        self._texture_bg = None
+        if bg_surface:
+            cairo_context = cairo.Context(bg_surface)
+            if thumb_surface:
+                cairo_context.save()
+                thumb_width, thumb_height = style.zoom(100), style.zoom(80)
+                orig_w = thumb_surface.get_width()
+                orig_h = thumb_surface.get_height()
+                if orig_w > 0 and orig_h > 0:
+                    scale_x = thumb_width / orig_w
+                    scale_y = thumb_height / orig_h
+                    cairo_context.translate(self._dest_x, self._dest_y)
+                    cairo_context.scale(scale_x, scale_y)
+                    cairo_context.set_source_surface(thumb_surface, 0, 0)
+                    cairo_context.rectangle(0, 0, orig_w, orig_h)
+                    cairo_context.fill()
+                cairo_context.restore()
+
+            stream = io.BytesIO()
+            bg_surface.write_to_png(stream)
+            png_bytes = GLib.Bytes.new(stream.getvalue())
+            try:
+                self._texture_bg = Gdk.Texture.new_from_bytes(png_bytes)
+            except Exception as e:
+                logging.error('Failed to load background texture: %s', e)
+
+        if self._texture_bg is not None:
+            self._img.set_paintable(self._texture_bg)
+        self._img.set_size_request(bg_width, bg_height)
         self.set_icon_widget(self._img)
-        self._img.show()
 
     def _read_link_background(self, filename):
-        icon_file = open(filename, 'rb')
-        data = icon_file.read()
-        icon_file.close()
+        with open(filename, 'rb') as icon_file:
+            data = icon_file.read()
 
         entity = b'<!ENTITY fill_color "%s">' % self._fill.encode()
         data = re.sub(b'<!ENTITY fill_color .*>', entity, data)
@@ -111,11 +145,18 @@ class LinkButton(TrayButton, GObject.GObject):
         link_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
                                           link_width, link_height)
         link_context = cairo.Context(link_surface)
-        link_scale_w = link_width * 1.0 / 120
-        link_scale_h = link_height * 1.0 / 110
-        link_context.scale(link_scale_w, link_scale_h)
-        handler = Rsvg.Handle.new_from_data(data)
-        handler.render_cairo(link_context)
+        try:
+            handler = Rsvg.Handle.new_from_data(data)
+            rect = Rsvg.Rectangle()
+            rect.x = float(0)
+            rect.y = float(0)
+            rect.width = float(link_width)
+            rect.height = float(link_height)
+            handler.render_document(link_context, rect)
+        except Exception as e:
+            logging.error('Error rendering SVG background: %s', e)
+            return None
+
         return link_surface
 
     def setup_rollover_options(self, info):
@@ -124,16 +165,13 @@ class LinkButton(TrayButton, GObject.GObject):
 
         box = PaletteMenuBox()
         palette.set_content(box)
-        box.show()
 
         menu_item = PaletteMenuItem(_('Remove'), 'list-remove')
-        menu_item.connect('activate', self.item_remove_cb)
+        menu_item.connect('clicked', self.item_remove_cb)
         box.append_item(menu_item)
-        menu_item.show()
 
         separator = PaletteMenuItemSeparator()
         box.append_item(separator)
-        separator.show()
 
         textview = Gtk.TextView()
         textview.props.height_request = style.GRID_CELL_SIZE * 2
@@ -141,7 +179,6 @@ class LinkButton(TrayButton, GObject.GObject):
         textview.props.hexpand = True
         textview.props.vexpand = True
         box.append_item(textview)
-        textview.show()
 
         buffer = textview.get_buffer()
         if self.notes is None:

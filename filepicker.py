@@ -21,8 +21,8 @@ import shutil
 
 from gi.repository import Gtk
 
-from sugar3.graphics.objectchooser import ObjectChooser
-from sugar3.activity.activity import get_activity_root
+from sugar4.graphics.objectchooser import ObjectChooser
+from sugar4.activity.activity import get_activity_root
 
 
 _temp_dirs_to_clean = []
@@ -39,17 +39,18 @@ def cleanup_temp_files():
 
 
 class FilePicker(ObjectChooser):
-    def __init__(self, parent):
-        ObjectChooser.__init__(self, parent)
+    def __init__(self, parent, callback):
+        super().__init__(parent)
+        self._callback = callback
+        self.connect('response', self.__on_response)
 
-    def run(self):
-        jobject = None
+    def __on_response(self, chooser, response_id):
         _file = None
+        jobject = None
         try:
-            result = ObjectChooser.run(self)
-            if result == Gtk.ResponseType.ACCEPT:
+            if response_id == Gtk.ResponseType.ACCEPT:
                 jobject = self.get_selected_object()
-                logging.debug('FilePicker.show: %r', jobject)
+                logging.debug('FilePicker.__on_response: %r', jobject)
 
                 if jobject and jobject.file_path:
                     tmp_dir = tempfile.mkdtemp(
@@ -59,15 +60,15 @@ class FilePicker(ObjectChooser):
 
                     os.rename(jobject.file_path, _file)
 
-                    global _temp_dirs_to_clean
                     _temp_dirs_to_clean.append(tmp_dir)
 
-                    logging.debug('FilePicker.show: file=%r', _file)
+                    logging.debug('FilePicker.__on_response: file=%r', _file)
         finally:
             if jobject is not None:
                 jobject.destroy()
 
-        return _file
+        self._callback(_file)
+        self.destroy()
 
 
 def _basename_strip(jobject):

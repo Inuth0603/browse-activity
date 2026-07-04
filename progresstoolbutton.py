@@ -14,40 +14,43 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
-The progress toolbutton is a :class:`sugar3.graphics.progressicon.ProgressIcon`
-that fits into a toolbar.  It is a great way to convey progress of an
-ongoing background operation, especially if you want to have a palette with
-more detailed information.
+The progress toolbutton fits into a toolbar and displays a static icon.
+Because ProgressIcon is no longer available in the toolkit, this is currently
+a standard ToolButton that accepts progress updates as a no-op compatibility stub.
 
 Using the progress toolbutton is just like using a regular toolbutton; you
-set the icon name and add it to the toolbar.  You can then use the `update`
-function as the operation progresses to change the fill percentage.
+set the icon name and add it to the toolbar (e.g. using `toolbar.append(...)`
+instead of GTK3's `toolbar.insert(..., -1)`). You can then use the `update`
+function as the operation progresses, although it currently has no visual effect.
 
 Example::
 
     self._download_icon = ProgressToolButton(icon_name='emblem-downloads')
     self._download_icon.props.tooltip = _('No Download Running')
-    toolbar.insert(self._download_icon, -1)
-    self._download_icon.show()
+    toolbar.append(self._download_icon)
 
     def __download_progress_cb(self, progress):
         self._download_icon.props.tooltip = _('Downloading')
         self._download_icon.update(progress)
 '''
 
+import logging
+
 from gi.repository import Gtk
 from gi.repository import GObject
 
-from sugar3.graphics import style
-from sugar3.graphics.toolbutton import ToolButton
-from sugar3.graphics.progressicon import ProgressIcon
-from sugar3.graphics.xocolor import XoColor
+from sugar4.graphics import style
+from sugar4.graphics.toolbutton import ToolButton
+from sugar4.graphics.icon import Icon
+from sugar4.graphics.xocolor import XoColor
 
 
 class ProgressToolButton(ToolButton):
     '''
-    This button is just like a normal tool button, except that the
-    icon can dynamically fill based on a progress number.
+    This button is just like a normal tool button. Because `ProgressIcon`
+    is no longer available, the icon no longer fills dynamically based on a
+    progress number — this class is a stub for API compatibility with
+    visual progress disabled.
     '''
 
     __gtype_name__ = 'SugarProgressToolButton'
@@ -55,8 +58,9 @@ class ProgressToolButton(ToolButton):
     def __init__(self, **kwargs):
         self._xo_color = XoColor('insensitive')
         self._icon_name = None
-        self._direction = 'vertical'
         self._progress = 0.0
+        self._direction = 'vertical'
+        self._icon = None
 
         ToolButton.__init__(self, **kwargs)
         # GObject should do this, but something down the ToolButton chain of
@@ -73,7 +77,7 @@ class ProgressToolButton(ToolButton):
     def xo_color(self):
         '''
         This property defines the stroke and fill of the icon, and is
-        the type :class:`sugar3.graphics.xocolor.XoColor`
+        the type :class:`sugar4.graphics.xocolor.XoColor`
         '''
         return self._xo_color
 
@@ -85,7 +89,7 @@ class ProgressToolButton(ToolButton):
     @GObject.property
     def icon_name(self):
         '''
-        Icon name (same as with a :class:`sugar3.graphics.icon.Icon`), as the
+        Icon name (same as with a :class:`sugar4.graphics.icon.Icon`), as the
         type :class:`str`
         '''
         return self._icon_name
@@ -98,7 +102,11 @@ class ProgressToolButton(ToolButton):
     @GObject.property
     def direction(self):
         '''
-        Direction for the icon to fill as it progresses, filling either,
+        DEPRECATED: This property is fully inert and is only
+        preserved for API compatibility (specifically, kwargs/constructor
+        compatibility with existing Activities that pass `direction=...`).
+
+        Historically, it set the direction for the icon to fill as it progresses:
         * :class:`Gtk.Orientation.VERTICAL` - bottom to top
         * :class:`Gtk.Orientation.HORIZONTAL` - user's text direction
         '''
@@ -116,25 +124,40 @@ class ProgressToolButton(ToolButton):
         self._updated()
 
     def _updated(self):
-        self._icon = ProgressIcon(
-            self._icon_name,
-            style.STANDARD_ICON_SIZE,
-            self._xo_color.get_stroke_color(),
-            self._xo_color.get_fill_color(),
-            self._direction)
-        self._icon.update(self._progress)
+        if self._icon_name is None:
+            # We explicitly return early here to suppress the Icon widget's
+            # built-in fallback to "document-generic". For a ToolButton,
+            # an empty button is preferred over a misleading generic icon.
+            logging.warning('ProgressToolButton updated with no icon_name set')
+            return
+
+        self._icon = Icon(
+            icon_name=self._icon_name,
+            pixel_size=style.STANDARD_ICON_SIZE,
+            stroke_color=self._xo_color.get_stroke_color(),
+            fill_color=self._xo_color.get_fill_color())
+        # TODO: self._direction is stored but not currently passed to Icon.
+        # Icon currently has no update() method to re-apply progress
+        # after icon recreation; _progress is preserved in state only.
         self.set_icon_widget(self._icon)
         self._icon.show()
 
     def update(self, progress):
         '''
-        Redraw the icon with a different percentage filled in
+        Stub for API compatibility.
+        Because ProgressIcon is no longer available in the toolkit,
+        this method currently just stores state without visual effect.
+
+        Note: This method explicitly calls queue_draw() for forward compatibility,
+        ensuring that if a progress-rendering icon is ever reintroduced, callers
+        won't need to change their code to trigger a repaint.
 
         Args:
-            progress (float): a value from 0.0 to 1.0, where 1.0 fully
-                fills the icon and 0.0 results in only the stroke being
-                visible
+            progress (float): A number between 0.0 and 1.0 representing
+                              the progress percentage.
         '''
         self._progress = progress
-        self._icon.update(progress)
+        # Preserve queue_draw() for forward compatibility: if a progress-
+        # rendering icon is ever reintroduced, callers expect update() to
+        # trigger a repaint.
         self.queue_draw()
