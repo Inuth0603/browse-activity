@@ -22,76 +22,73 @@ from gettext import ngettext
 import os
 
 import gi
-gi.require_version('Gtk', '3.0')
+gi.require_version('Gtk', '4.0')
 try:
     incompatible = False
-    gi.require_version('WebKit2', '4.1')
+    gi.require_version('WebKit', '6.0')
 except BaseException:
     incompatible = True
 gi.require_version('Soup', '3.0')
 
-from gi.repository import GObject
-GObject.threads_init()
-
 from gi.repository import Gtk
 from gi.repository import Gdk
+from gi.repository import GLib
 from gi.repository import Gio
-from gi.repository import WebKit2
+from gi.repository import WebKit
 from gi.repository import Soup
 
 from base64 import b64decode, b64encode
 import time
 import shutil
 import json
-import cairo
-import io
 from hashlib import sha1
 
-from sugar3.activity import activity
-from sugar3.activity.widgets import StopButton
-from sugar3.graphics import style
-from sugar3.graphics.alert import Alert
-from sugar3.graphics.alert import NotifyAlert
-from sugar3.graphics.icon import Icon
-from sugar3.graphics.animator import Animator, Animation
-from sugar3 import mime
-from sugar3.graphics.toolbarbox import ToolbarBox, ToolbarButton
-from sugar3 import profile
+from sugar4.activity import activity
+from sugar4.activity.widgets import StopButton
+from sugar4.graphics import style
+from sugar4.graphics.alert import Alert
+from sugar4.graphics.alert import NotifyAlert
+from sugar4.graphics.icon import Icon
+from sugar4 import mime
+from sugar4.graphics.toolbarbox import ToolbarBox, ToolbarButton
+from sugar4 import profile
 
 from collabwrapper import CollabWrapper
 from widgets import TitledTray
 
 
-PROFILE_VERSION = 2
+_BLANK_THUMBNAIL_PNG = (
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDw'
+    'AChwGA60e6kgAAAABJRU5ErkJggg=='
+)
 
 THUMB_WIDTH, THUMB_HEIGHT = style.zoom(100), style.zoom(80)
 
-_profile_version = 0
-_profile_path = os.path.join(activity.get_activity_root(), 'data/gecko')
+_logger = logging.getLogger('web-activity')
+
+_profile_path = os.path.join(activity.get_activity_root(), 'data', 'profile')
+_old_profile_path = os.path.join(activity.get_activity_root(), 'data', 'gecko')
+
+# Migrate the legacy XULRunner 'data/gecko' directory to a generic
+# 'data/profile' directory, as Gecko/NSS specific artifacts (cert8.db)
+# are no longer used.
+if os.path.exists(_old_profile_path) and not os.path.exists(_profile_path):
+    try:
+        shutil.move(_old_profile_path, _profile_path)
+    except OSError as e:
+        _logger.error('Failed to migrate profile directory: %s', e)
+elif not os.path.exists(_profile_path):
+    os.makedirs(_profile_path)
+
+# Clean up stray version file if it migrated over
 _version_file = os.path.join(_profile_path, 'version')
-_cookies_db_path = os.path.join(_profile_path, 'cookies.sqlite')
-
 if os.path.exists(_version_file):
-    f = open(_version_file)
-    _profile_version = int(f.read())
-    f.close()
+    try:
+        os.remove(_version_file)
+    except OSError:
+        pass
 
-if _profile_version < PROFILE_VERSION:
-    if not os.path.exists(_profile_path):
-        os.mkdir(_profile_path)
-
-    if os.path.exists('cert8.db'):
-        shutil.copy('cert8.db', _profile_path)
-    else:
-        # wikipedia activity use a empty file
-        with open(os.path.join(_profile_path, 'cert8.db'), 'w') as cert_file:
-            cert_file.write('')
-
-    os.chmod(os.path.join(_profile_path, 'cert8.db'), 0o660)
-
-    f = open(_version_file, 'w')
-    f.write(str(PROFILE_VERSION))
-    f.close()
+_cookies_db_path = os.path.join(_profile_path, 'cookies.sqlite')
 
 
 def _seed_xs_cookie(cookie_jar):
@@ -148,8 +145,6 @@ SERVICE = "org.laptop.WebActivity"
 IFACE = SERVICE
 PATH = "/org/laptop/WebActivity"
 
-_logger = logging.getLogger('web-activity')
-
 
 class WebActivity(activity.Activity):
     def __init__(self, handle):
@@ -164,33 +159,68 @@ class WebActivity(activity.Activity):
 
         _logger.debug('Starting the web activity')
 
-        # TODO PORT
-        # session = WebKit2.get_default_session()
-        # session.set_property('accept-language-auto', True)
-        # session.set_property('ssl-use-system-ca-file', True)
-        # session.set_property('ssl-strict', False)
+        # Whitelist directories for the WebKit sandbox BEFORE any WebView is
+        # created.
+        # Calling add_path_to_sandbox after WebProcess creation causes a C
+        # abort.
+        try:
+            context = WebKit.WebContext.get_default()
+            if hasattr(context, 'add_path_to_sandbox'):
+                # 1. Downloads directory
+                downloads_dir = GLib.get_user_special_dir(
+                    GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+                if downloads_dir is None:
+                    downloads_dir = os.path.join(
+                        os.path.expanduser("~"), "Downloads")
+                if not os.path.exists(downloads_dir):
+                    os.makedirs(downloads_dir)
+                context.add_path_to_sandbox(downloads_dir, True)
 
-        # But of a hack, but webkit doesn't let us change the cookie jar
-        # contents, we we can just pre-seed it
+                # 2. Datastore/Journal directory
+                from sugar4 import env
+                datastore_dir = os.path.join(
+                    env.get_profile_path(), 'datastore')
+                if os.path.exists(datastore_dir):
+                    context.add_path_to_sandbox(datastore_dir, True)
+        except Exception as e:
+            _logger.error('Failed to configure sandbox paths: %s', e)
+
+        network_session = WebKit.NetworkSession.get_default()
+
+        # WebKit 6.0 handles system CA resolution natively, and automatically
+        # constructs the Accept-Language header based on the system locale.
+
+        # NetworkSession handles TLS strictness directly via
+        # TLSErrorsPolicy. TLS errors are explicitly ignored here.
+        network_session.set_tls_errors_policy(WebKit.TLSErrorsPolicy.IGNORE)
+
+        # Bit of a hack, but webkit doesn't let us change the cookie jar
+        # contents, so we can just pre-seed it
         cookie_jar = Soup.CookieJarDB(filename=_cookies_db_path,
-                                               read_only=False)
+                                      read_only=False)
         _seed_xs_cookie(cookie_jar)
+        # Explicitly delete the Soup.CookieJarDB instance to drop the Python
+        # reference, which triggers synchronous cleanup of its underlying
+        # SQLite connection. This prevents lock contention when WebKit's
+        # NetworkSession opens the same file immediately below.
         del cookie_jar
 
-        context = WebKit2.WebContext.get_default()
-        cookie_manager = context.get_cookie_manager()
+        cookie_manager = network_session.get_cookie_manager()
         cookie_manager.set_persistent_storage(
-            _cookies_db_path, WebKit2.CookiePersistentStorage.SQLITE)
+            _cookies_db_path, WebKit.CookiePersistentStorage.SQLITE)
 
         # FIXME
         # downloadmanager.remove_old_parts()
-        context.connect('download-started', self.__download_requested_cb)
+        network_session.connect(
+            'download-started',
+            self.__download_requested_cb)
 
         self._tabbed_view = TabbedView(self)
         self._tabbed_view.connect('focus-url-entry', self._on_focus_url_entry)
         self._tabbed_view.connect('switch-page', self.__switch_page_cb)
 
         self._titled_tray = TitledTray(_('Bookmarks'))
+        self._titled_tray.hide()
         self._tray = self._titled_tray.tray
         self.set_tray(self._titled_tray, Gtk.PositionType.BOTTOM)
         self._tray_links = {}
@@ -213,21 +243,24 @@ class WebActivity(activity.Activity):
         self._edit_toolbar_button = ToolbarButton(
             page=self._edit_toolbar, icon_name='toolbar-edit')
 
-        self._primary_toolbar.toolbar.insert(
-            self._edit_toolbar_button, 1)
+        first_child = self._primary_toolbar.toolbar.get_first_child()
+        self._primary_toolbar.toolbar.insert_child_after(
+            self._edit_toolbar_button, first_child)
 
         view_toolbar_button = ToolbarButton(
             page=self._view_toolbar, icon_name='toolbar-view')
-        self._primary_toolbar.toolbar.insert(
-            view_toolbar_button, 2)
+        self._primary_toolbar.toolbar.insert_child_after(
+            view_toolbar_button, self._edit_toolbar_button)
 
-        self._primary_toolbar.show_all()
+        self._primary_toolbar.show()
         self.set_toolbar_box(self._primary_toolbar)
 
         self.set_canvas(self._tabbed_view)
         self._tabbed_view.show()
 
-        self.connect('key-press-event', self._key_press_cb)
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect('key-pressed', self._key_press_cb)
+        self.add_controller(key_controller)
 
         if handle.uri:
             self._tabbed_view.current_browser.load_uri(handle.uri)
@@ -243,13 +276,14 @@ class WebActivity(activity.Activity):
         self._collab.setup()
 
     def __download_requested_cb(self, context, download):
+        # NetworkSession's download-started signal signature is void,
+        # so no value is returned.
         if hasattr(self, 'busy'):
             while self.unbusy() > 0:
                 continue
         logging.debug('__download_requested_cb %r',
                       download.get_request().get_uri())
         downloadmanager.add_download(download, self)
-        return True
 
     def fullscreen(self):
         activity.Activity.fullscreen(self)
@@ -435,63 +469,63 @@ class WebActivity(activity.Activity):
     def _alert_cancel_cb(self, alert, response_id):
         self.remove_alert(alert)
 
-    def _key_press_cb(self, widget, event):
+    def _key_press_cb(self, controller, keyval, keycode, state):
         browser = self._tabbed_view.props.current_browser
 
-        if event.get_state() & Gdk.ModifierType.CONTROL_MASK:
-            if event.keyval == Gdk.KEY_f:
+        if state & Gdk.ModifierType.CONTROL_MASK:
+            if keyval == Gdk.KEY_f:
                 self._edit_toolbar_button.set_expanded(True)
                 self._edit_toolbar.search_entry.grab_focus()
                 return True
-            if event.keyval == Gdk.KEY_l:
+            if keyval == Gdk.KEY_l:
                 self._primary_toolbar.entry.grab_focus()
                 return True
-            if event.keyval == Gdk.KEY_equal:
+            if keyval == Gdk.KEY_equal:
                 # On US keyboards, KEY_equal is KEY_plus without
                 # SHIFT_MASK, so for convenience treat this as the
                 # same as the zoom in accelerator configured in
-                # WebKit2
+                # WebKit
                 browser.zoom_in()
                 return True
-            if event.keyval == Gdk.KEY_t:
+            if keyval == Gdk.KEY_t:
                 self._tabbed_view.add_tab()
                 return True
-            if event.keyval == Gdk.KEY_w:
+            if keyval == Gdk.KEY_w:
                 self._tabbed_view.close_tab()
                 return True
 
             # FIXME: copy and paste is supposed to be handled by
             # Gtk.Entry, but does not work when we catch
             # key-press-event and return False.
-            if self._primary_toolbar.entry.is_focus():
-                if event.keyval == Gdk.KEY_c:
+            if self._primary_toolbar.entry.has_focus():
+                if keyval == Gdk.KEY_c:
                     self._primary_toolbar.entry.copy_clipboard()
                     return True
-                if event.keyval == Gdk.KEY_v:
+                if keyval == Gdk.KEY_v:
                     self._primary_toolbar.entry.paste_clipboard()
                     return True
 
             return False
 
-        if event.keyval in (Gdk.KEY_KP_Up, Gdk.KEY_KP_Down,
-                            Gdk.KEY_KP_Left, Gdk.KEY_KP_Right):
+        if keyval in (Gdk.KEY_KP_Up, Gdk.KEY_KP_Down,
+                      Gdk.KEY_KP_Left, Gdk.KEY_KP_Right):
             scrolled_window = browser.get_parent()
 
-            if event.keyval in (Gdk.KEY_KP_Up, Gdk.KEY_KP_Down):
+            if keyval in (Gdk.KEY_KP_Up, Gdk.KEY_KP_Down):
                 adjustment = scrolled_window.get_vadjustment()
-            elif event.keyval in (Gdk.KEY_KP_Left, Gdk.KEY_KP_Right):
+            elif keyval in (Gdk.KEY_KP_Left, Gdk.KEY_KP_Right):
                 adjustment = scrolled_window.get_hadjustment()
             value = adjustment.get_value()
             step = adjustment.get_step_increment()
 
-            if event.keyval in (Gdk.KEY_KP_Up, Gdk.KEY_KP_Left):
+            if keyval in (Gdk.KEY_KP_Up, Gdk.KEY_KP_Left):
                 adjustment.set_value(value - step)
             else:
                 adjustment.set_value(value + step)
 
             return True
 
-        if event.keyval == Gdk.KEY_Escape:
+        if keyval == Gdk.KEY_Escape:
             browser.stop_loading()
             return False  # allow toolbar entry to handle escape too
 
@@ -506,13 +540,38 @@ class WebActivity(activity.Activity):
         if self.model.has_link(ui_uri):
             return
 
-        buf = b64encode(self._get_screenshot()).decode('ascii')
-        timestamp = time.time()
-        args = (ui_uri, browser.props.title, buf,
-                profile.get_nick_name(),
-                profile.get_color().to_string(), timestamp)
-        self.model.add_link(*args, by_me=True)
-        self._collab.post({'type': 'add_link', 'args': args})
+        def add_link_with_buf(buf_bytes):
+            if self.model.has_link(ui_uri):
+                return
+            buf = b64encode(buf_bytes).decode('ascii')
+            timestamp = time.time()
+            args = (ui_uri, browser.props.title, buf,
+                    profile.get_nick_name(),
+                    profile.get_color().to_string(), timestamp)
+            self.model.add_link(*args, by_me=True)
+            self._collab.post({'type': 'add_link', 'args': args})
+
+        def snapshot_ready(webview, result):
+            try:
+                snapshot_texture = webview.get_snapshot_finish(result)
+                bytes_data = snapshot_texture.save_to_png_bytes()
+                add_link_with_buf(bytes_data.get_data())
+            except Exception as e:
+                logging.error('Failed to get/save snapshot: %s', e)
+                add_link_with_buf(b64decode(_BLANK_THUMBNAIL_PNG))
+
+        if not hasattr(browser, 'get_snapshot'):
+            add_link_with_buf(b64decode(_BLANK_THUMBNAIL_PNG))
+            return
+
+        try:
+            browser.get_snapshot(WebKit.SnapshotRegion.VISIBLE,
+                                 WebKit.SnapshotOptions.NONE,
+                                 None,
+                                 snapshot_ready)
+        except Exception as e:
+            logging.error('Snapshot API error: %s', e)
+            add_link_with_buf(b64decode(_BLANK_THUMBNAIL_PNG))
 
     def __message_cb(self, collab, buddy, message):
         type_ = message.get('type')
@@ -549,10 +608,9 @@ class WebActivity(activity.Activity):
             link.get('notes'))
 
         if by_me:
-            animator = Animator(1, widget=self)
-            animator.add(AddLinkAnimation(
-                self, self._tabbed_view.props.current_browser, widget))
-            animator.start()
+            # TODO: Restore custom zoom/fade animation using Gtk.Snapshot.
+            # For now, just show the thumb immediately.
+            widget.show_thumb()
 
     def _add_link_totray(self, url, buf, color, title, owner, index, hash,
                          notes=None):
@@ -564,6 +622,7 @@ class WebActivity(activity.Activity):
         # use index to add to the tray
         self._tray_links[hash] = item
         self._tray.add_item(item, index)
+        self._titled_tray.show()
         item.show()
         self._view_toolbar.traybutton.props.sensitive = True
         self._view_toolbar.traybutton.props.active = True
@@ -576,15 +635,15 @@ class WebActivity(activity.Activity):
 
     def remove_link(self, hash):
         ''' remove a link from tray and delete it in the model '''
-        self._tray_links[hash].hide()
-        self._tray_links[hash].destroy()
+        self._tray_links[hash].unparent()
         del self._tray_links[hash]
 
         self.model.remove_link(hash)
-        if len(self._tray.get_children()) == 0:
+        if self._tray.get_first_child() is None:
             self._view_toolbar.traybutton.props.sensitive = False
             self._view_toolbar.traybutton.props.active = False
             self._view_toolbar.update_traybutton_tooltip()
+            self._titled_tray.hide()
 
     def __link_notes_changed(self, button, hash, notes):
         self.model.change_link_notes(hash, notes)
@@ -594,25 +653,6 @@ class WebActivity(activity.Activity):
         browser = self._tabbed_view.add_tab()
         browser.load_uri(url)
         browser.grab_focus()
-
-    def _get_screenshot(self):
-        browser = self._tabbed_view.props.current_browser
-        window = browser.get_window()
-        width, height = window.get_width(), window.get_height()
-
-        thumb_surface = Gdk.Window.create_similar_surface(
-            window, cairo.CONTENT_COLOR, THUMB_WIDTH, THUMB_HEIGHT)
-
-        cairo_context = cairo.Context(thumb_surface)
-        thumb_scale_w = THUMB_WIDTH * 1.0 / width
-        thumb_scale_h = THUMB_HEIGHT * 1.0 / height
-        cairo_context.scale(thumb_scale_w, thumb_scale_h)
-        Gdk.cairo_set_source_window(cairo_context, window, 0, 0)
-        cairo_context.paint()
-
-        thumb_str = io.BytesIO()
-        thumb_surface.write_to_png(thumb_str)
-        return thumb_str.getvalue()
 
     def can_close(self):
         if self._force_close:
@@ -677,7 +717,7 @@ class WebActivity(activity.Activity):
         ''' Display abbreviated activity user interface with alert '''
         toolbox = ToolbarBox()
         stop = StopButton(self)
-        toolbox.toolbar.add(stop)
+        toolbox.toolbar.append(stop)
         self.set_toolbar_box(toolbox)
 
         title = _('Activity not compatible with this system.')
@@ -686,8 +726,8 @@ class WebActivity(activity.Activity):
         alert.add_button(0, 'Stop', Icon(icon_name='activity-stop'))
         self.add_alert(alert)
 
-        label = Gtk.Label(_('Uh oh, WebKit2 is too old. '
-                            'Browse-200 and later require WebKit2 API 4.0, '
+        label = Gtk.Label(_('Uh oh, WebKit is too old. '
+                            'Browse-200 and later require WebKit API 6.0, '
                             'sorry!'))
         self.set_canvas(label)
 
@@ -704,7 +744,7 @@ class WebActivity(activity.Activity):
         stop.connect('clicked', self.__incompatible_stop_clicked_cb,
                      alert)
 
-        self.show_all()
+        self.show()
 
     def __incompatible_stop_clicked_cb(self, button, alert):
         self.remove_alert(alert)
@@ -712,93 +752,3 @@ class WebActivity(activity.Activity):
     def __incompatible_response_cb(self, alert, response):
         self.remove_alert(alert)
         self.close()
-
-
-class AddLinkAnimation(Animation):
-
-    def __init__(self, widget, browser, tray_widget):
-        Animation.__init__(self, 0, 3)
-        self._draw_hid = None
-        self._widget = widget
-        self._browser = browser
-        self._tray_widget = tray_widget
-        self._tray_widget.hide_thumb()
-
-        self._balloc = browser.get_allocation()
-        self._center = ((self._balloc.width) / 2.0,
-                        (self._balloc.height) / 2.0)
-
-        window = browser.get_window()
-        width, height = window.get_width(), window.get_height()
-
-        self._snap = Gdk.Window.create_similar_surface(
-            window, cairo.CONTENT_COLOR, width, height)
-        cairo_context = cairo.Context(self._snap)
-        Gdk.cairo_set_source_window(cairo_context, window, 0, 0)
-        cairo_context.paint()
-
-    def do_frame(self, t, duration, easing):
-        # exponential ease in/out
-        t /= duration / 2.0
-        if t < 1:
-            frame = self.end / 2.0 * pow(2, 10 * (t - 1))
-        else:
-            t -= 1
-            frame = self.end / 2.0 * (-pow(2, -10 * t) + 2)
-        self.next_frame(frame)
-
-    def next_frame(self, frame):
-        self._frame = frame
-        if self._draw_hid is None:
-            self._draw_hid = self._widget.connect_after('draw', self.__draw_cb)
-        self._widget.queue_draw()
-
-    def __draw_cb(self, widget, cr):
-        cr.save()
-
-        thumb_scale_w = THUMB_WIDTH * 1.0 / self._balloc.width
-        thumb_scale_h = THUMB_HEIGHT * 1.0 / self._balloc.height
-        rect = (self._balloc.x, self._balloc.y,
-                self._balloc.width, self._balloc.height)
-        ox, oy = self._browser.translate_coordinates(widget, 0, 0)
-        if self._frame < 1.0:
-            frame = self._frame
-            notframe = 1.0 - frame
-
-            cr.save()
-            cr.translate(ox, oy)
-            cr.set_source_rgba(1.0, 1.0, 1.0, notframe)
-            cr.rectangle(*rect)
-            cr.fill()
-            cr.restore()
-
-            cr.translate(ox + (self._center[0] * frame),
-                         oy + (self._center[1] * frame))
-            cr.scale(notframe + (thumb_scale_w * frame),
-                     notframe + (thumb_scale_h * frame))
-            stroke_alpha = frame
-            width = 20 * frame
-        else:
-            frame = (self._frame - 1.0) / 2.0
-            notframe = 1.0 - frame
-            x, y = self._tray_widget.get_image_coords(widget)
-            cr.translate(((ox + self._center[0]) * notframe) + (x * frame),
-                         ((oy + self._center[1]) * notframe) + (y * frame))
-            cr.scale(thumb_scale_w, thumb_scale_h)
-            stroke_alpha = notframe
-            width = 20
-
-        cr.set_source_surface(self._snap)
-        cr.rectangle(*rect)
-        cr.fill()
-        cr.set_source_rgba(0.0, 0.0, 0.0, stroke_alpha)
-        cr.set_line_width(width)
-        cr.rectangle(*rect)
-        cr.stroke()
-
-        cr.restore()
-
-    def do_stop(self):
-        self._tray_widget.show_thumb()
-        self._widget.disconnect(self._draw_hid)
-        self._widget.queue_draw()
