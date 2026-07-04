@@ -18,28 +18,29 @@ import os
 import logging
 from gettext import gettext as _
 
-import gi
 from gi.repository import GObject
 from gi.repository import Gtk
 from gi.repository import GLib
-from gi.repository import WebKit2
+from gi.repository import WebKit
 
-from sugar3.graphics.toolbarbox import ToolbarBox
-from sugar3.graphics.toolbutton import ToolButton
-from sugar3.graphics.toggletoolbutton import ToggleToolButton
-from sugar3.graphics.icon import Icon
-from sugar3.graphics.progressicon import ProgressIcon
-from sugar3.graphics import style
-from sugar3.datastore import datastore
-from sugar3.activity import activity
-from sugar3.bundle.activitybundle import ActivityBundle
+from sugar4.graphics.toolbarbox import ToolbarBox
+from sugar4.graphics.toolbutton import ToolButton
+from sugar4.graphics.toggletoolbutton import ToggleToolButton
+from sugar4.graphics.icon import Icon
+from sugar4.graphics import style
+from sugar4.datastore import datastore
+from sugar4.activity import activity
+from sugar4.bundle.activitybundle import ActivityBundle
 
 import downloadmanager
 
 
-class EvinceViewer(Gtk.VBox):
-    """PDF viewer with a toolbar overlay for basic navigation and an
-    option to save to Journal.
+class EvinceViewer(Gtk.Box):
+    """PDF viewer using WebKit, with a bottom toolbar for basic navigation
+    and an option to save to Journal.
+
+    Note: The native EvinceView is unavailable, so this viewer renders
+    PDFs via WebKit.WebView instead.
 
     """
     __gsignals__ = {
@@ -51,45 +52,29 @@ class EvinceViewer(Gtk.VBox):
                       ([str])), }
 
     def __init__(self, uri):
-        GObject.GObject.__init__(self)
+        Gtk.Box.__init__(self, orientation=Gtk.Orientation.VERTICAL)
 
         self._uri = uri
 
-        # delay Evince import until is needed to improve activity startup time
-        gi.require_version('EvinceDocument', '3.0')
-        gi.require_version('EvinceView', '3.0')
-        from gi.repository import EvinceDocument
-        from gi.repository import EvinceView
+        # Use WebKit.WebView instead of Evince since the native EvinceView
+        # widget is unavailable
+        self._view = WebKit.WebView()
+        self._view.connect('decide-policy', self.__decide_policy_cb)
+        self._view.load_uri(uri)
 
-        # Create Evince objects to handle the PDF in the URI:
-        EvinceDocument.init()
-        self._doc = EvinceDocument.Document.factory_get_document(uri)
-        self._view = EvinceView.View()
-        self._model = EvinceView.DocumentModel()
-        self._model.set_document(self._doc)
-        self._view.set_model(self._model)
-
-        self._EVINCE_MODE_FREE = EvinceView.SizingMode.FREE
-
-        self._view.connect('external-link', self.__handle_link_cb)
-        self._model.connect('page-changed', self.__page_changed_cb)
-
-        self._back_page_button = None
-        self._forward_page_button = None
         self._toolbar_box = self._create_toolbar()
-        self._update_nav_buttons()
-
-        self._toolbar_box.set_halign(Gtk.Align.FILL)
-        self._toolbar_box.set_valign(Gtk.Align.END)
-        self.pack_end(self._toolbar_box, False, True, 0)
-        self._toolbar_box.show()
 
         scrolled_window = Gtk.ScrolledWindow()
-        self.pack_start(scrolled_window, True, True, 0)
+        scrolled_window.set_hexpand(True)
+        scrolled_window.set_vexpand(True)
+        scrolled_window.set_child(self._view)
+        self.append(scrolled_window)
         scrolled_window.show()
-
-        scrolled_window.add(self._view)
         self._view.show()
+
+        self._toolbar_box.set_halign(Gtk.Align.FILL)
+        self.append(self._toolbar_box)
+        self._toolbar_box.show()
 
     def _create_toolbar(self):
         toolbar_box = ToolbarBox()
@@ -97,54 +82,34 @@ class EvinceViewer(Gtk.VBox):
         zoom_out_button = ToolButton('zoom-out')
         zoom_out_button.set_tooltip(_('Zoom out'))
         zoom_out_button.connect('clicked', self.__zoom_out_cb)
-        toolbar_box.toolbar.insert(zoom_out_button, -1)
+        toolbar_box.toolbar.append(zoom_out_button)
         zoom_out_button.show()
 
         zoom_in_button = ToolButton('zoom-in')
         zoom_in_button.set_tooltip(_('Zoom in'))
         zoom_in_button.connect('clicked', self.__zoom_in_cb)
-        toolbar_box.toolbar.insert(zoom_in_button, -1)
+        toolbar_box.toolbar.append(zoom_in_button)
         zoom_in_button.show()
 
         zoom_original_button = ToolButton('zoom-original')
         zoom_original_button.set_tooltip(_('Actual size'))
         zoom_original_button.connect('clicked', self.__zoom_original_cb)
-        toolbar_box.toolbar.insert(zoom_original_button, -1)
+        toolbar_box.toolbar.append(zoom_original_button)
         zoom_original_button.show()
 
-        separator = Gtk.SeparatorToolItem()
-        separator.props.draw = True
-        toolbar_box.toolbar.insert(separator, -1)
-        separator.show()
-
-        self._back_page_button = ToolButton('go-previous-paired')
-        self._back_page_button.set_tooltip(_('Previous page'))
-        self._back_page_button.props.sensitive = False
-        self._back_page_button.connect('clicked', self.__go_back_page_cb)
-        toolbar_box.toolbar.insert(self._back_page_button, -1)
-        self._back_page_button.show()
-
-        self._forward_page_button = ToolButton('go-next-paired')
-        self._forward_page_button.set_tooltip(_('Next page'))
-        self._forward_page_button.props.sensitive = False
-        self._forward_page_button.connect('clicked', self.__go_forward_page_cb)
-        toolbar_box.toolbar.insert(self._forward_page_button, -1)
-        self._forward_page_button.show()
-
-        separator = Gtk.SeparatorToolItem()
-        separator.props.draw = True
-        toolbar_box.toolbar.insert(separator, -1)
+        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        toolbar_box.toolbar.append(separator)
         separator.show()
 
         self._save_to_journal_button = ToolButton('save-to-journal')
         self._save_to_journal_button.set_tooltip(_('Save PDF to Journal'))
         self._save_to_journal_button.connect('clicked',
                                              self.__save_to_journal_button_cb)
-        toolbar_box.toolbar.insert(self._save_to_journal_button, -1)
+        toolbar_box.toolbar.append(self._save_to_journal_button)
         self._save_to_journal_button.show()
 
-        separator = Gtk.SeparatorToolItem()
-        toolbar_box.toolbar.insert(separator, -1)
+        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        toolbar_box.toolbar.append(separator)
         separator.show()
 
         self._inverted_colors = ToggleToolButton(icon_name='dark-theme')
@@ -152,7 +117,7 @@ class EvinceViewer(Gtk.VBox):
         self._inverted_colors.set_accelerator('<Ctrl>i')
         self._inverted_colors.connect(
             'toggled', self.__inverted_colors_toggled_cb)
-        toolbar_box.toolbar.insert(self._inverted_colors, -1)
+        toolbar_box.toolbar.append(self._inverted_colors)
         self._inverted_colors.show()
 
         return toolbar_box
@@ -160,11 +125,23 @@ class EvinceViewer(Gtk.VBox):
     def disable_journal_button(self):
         self._save_to_journal_button.props.sensitive = False
 
-    def __handle_link_cb(self, widget, url):
-        self.emit('open-link', url.get_uri())
-
-    def __page_changed_cb(self, model, page_from, page_to):
-        self._update_nav_buttons()
+    def __decide_policy_cb(self, web_view, decision, decision_type):
+        if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
+            action = decision.get_navigation_action()
+            nav_type = action.get_navigation_type()
+            if nav_type == WebKit.NavigationType.LINK_CLICKED:
+                request = action.get_request()
+                if request:
+                    uri = request.get_uri()
+                    # Allow in-document anchor links (e.g. #page=5)
+                    # to be handled by WebKit's PDF viewer instead
+                    # of opening a new tab.
+                    if uri.startswith(self._uri):
+                        return False
+                    self.emit('open-link', uri)
+                    decision.ignore()
+                    return True
+        return False
 
     def __zoom_out_cb(self, widget):
         self.zoom_out()
@@ -175,23 +152,28 @@ class EvinceViewer(Gtk.VBox):
     def __zoom_original_cb(self, widget):
         self.zoom_original()
 
-    def __go_back_page_cb(self, widget):
-        self._view.previous_page()
-
-    def __go_forward_page_cb(self, widget):
-        self._view.next_page()
-
     def __save_to_journal_button_cb(self, widget):
         self.emit('save-to-journal')
         self._save_to_journal_button.props.sensitive = False
 
     def __inverted_colors_toggled_cb(self, button):
-        if hasattr(self._model, 'set_inverted_colors'):
-            self._model.set_inverted_colors(button.props.active)
+        # EvinceView had set_inverted_colors(); WebKit does not.
+        # Use a CSS filter on the document as a best-effort substitute.
+        # Note: this relies on WebKitGTK compositing the PDF within
+        # the normal page rendering pipeline.  If a future version
+        # renders PDFs via a native plugin that bypasses DOM
+        # compositing, the filter will silently have no effect.
         if button.props.active:
+            self._view.evaluate_javascript(
+                "document.documentElement.style.filter = "
+                "'invert(1) hue-rotate(180deg)';",
+                -1, None, None, None, None, None)
             button.set_icon_name('light-theme')
             button.set_tooltip(_('Normal Colors'))
         else:
+            self._view.evaluate_javascript(
+                "document.documentElement.style.filter = 'none';",
+                -1, None, None, None, None, None)
             button.set_icon_name('dark-theme')
             button.set_tooltip(_('Inverted Colors'))
 
@@ -202,26 +184,18 @@ class EvinceViewer(Gtk.VBox):
         self._inverted_colors.set_active(
             not self._inverted_colors.get_active())
 
-    def _update_nav_buttons(self):
-        current_page = self._model.props.page
-        self._back_page_button.props.sensitive = current_page > 0
-        self._forward_page_button.props.sensitive = \
-            current_page < self._doc.get_n_pages() - 1
-
     def zoom_original(self):
-        self._model.props.sizing_mode = self._EVINCE_MODE_FREE
-        self._model.props.scale = 1.0
+        self._view.set_zoom_level(1.0)
 
     def zoom_in(self):
-        self._model.props.sizing_mode = self._EVINCE_MODE_FREE
-        self._view.zoom_in()
+        self._view.set_zoom_level(self._view.get_zoom_level() + 0.1)
 
     def zoom_out(self):
-        self._model.props.sizing_mode = self._EVINCE_MODE_FREE
-        self._view.zoom_out()
+        self._view.set_zoom_level(max(0.1, self._view.get_zoom_level() - 0.1))
 
     def get_pdf_title(self):
-        return self._doc.get_title()
+        # WebKit returns the page/filename title, not the PDF metadata title.
+        return self._view.get_title()
 
 
 class DummyBrowser(GObject.GObject):
@@ -273,7 +247,7 @@ class DummyBrowser(GObject.GObject):
             self._progress = value
             if self._progress >= 1.0:
                 # Clear spinning cursor
-                self.emit('load-changed', WebKit2.LoadEvent.FINISHED)
+                self.emit('load-changed', WebKit.LoadEvent.FINISHED)
         else:
             raise AttributeError('Unknown property %s' % prop.name)
 
@@ -294,9 +268,6 @@ class DummyBrowser(GObject.GObject):
 
     def get_legacy_history(self):
         return [{'url': self.props.uri, 'title': self.props.title}]
-
-    def can_query_editing_commands(self):
-        return False
 
     def set_history_index(self, index):
         pass
@@ -325,8 +296,20 @@ class DummyBrowser(GObject.GObject):
     def destroy(self):
         pass
 
-    def get_window(self):
-        return self._tab.get_window()
+    def get_root(self):
+        return self._tab.get_root()
+
+    def get_snapshot(self, region, options, cancellable, callback, *args):
+        if self._tab._evince_viewer and self._tab._evince_viewer._view:
+            self._tab._evince_viewer._view.get_snapshot(
+                region, options, cancellable, callback, *args)
+        else:
+            raise AttributeError("PDF viewer not initialized")
+
+    def get_realized(self):
+        # Stub for duck-typing: browser.py and palettes.py call this directly
+        # on the browser object. Mapped is the closest equivalent state.
+        return self._tab.get_mapped()
 
     def get_allocation(self):
         return self._tab.get_allocation()
@@ -334,71 +317,87 @@ class DummyBrowser(GObject.GObject):
     def translate_coordinates(self, widget, x, y):
         return self._tab.translate_coordinates(widget, x, y)
 
+    def can_query_editing_commands(self):
+        # PDFs opened in this viewer are not editable.
+        return False
+
     # FIXME provide implementations
-    def can_execute_editing_command_finish(self):
+    def can_execute_editing_command_finish(self, result=None):
         pass
 
     def get_find_controller(self):
         return
 
 
-class PDFProgressMessageBox(Gtk.EventBox):
+class PDFProgressMessageBox(Gtk.Box):
     def __init__(self, message, button_callback):
-        Gtk.EventBox.__init__(self)
+        Gtk.Box.__init__(self, orientation=Gtk.Orientation.VERTICAL)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
 
-        self.modify_bg(Gtk.StateType.NORMAL,
-                       style.COLOR_WHITE.get_gdk_color())
+        self.add_css_class('pdf-message-box')
+        # CSS is injected dynamically here instead of sugar-artwork because
+        # the colour value is resolved at runtime from sugar4.graphics.style.
+        white = style.COLOR_WHITE.get_css_rgba()
+        css = f".pdf-message-box {{ background-color: {white}; }}"
+        style.apply_css_to_widget(self, css)
 
-        alignment = Gtk.Alignment.new(0.5, 0.5, 0.1, 0.1)
-        self.add(alignment)
-        alignment.show()
-
-        box = Gtk.VBox()
-        alignment.add(box)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.append(box)
         box.show()
 
-        icon = ProgressIcon(icon_name='book',
-                            pixel_size=style.LARGE_ICON_SIZE,
-                            stroke_color=style.COLOR_BUTTON_GREY.get_svg(),
-                            fill_color=style.COLOR_SELECTION_GREY.get_svg())
-        self.progress_icon = icon
+        # ProgressIcon is unavailable. We fallback to a standard static Icon
+        # paired with a native Gtk.ProgressBar.
+        icon = Icon(icon_name='book',
+                    pixel_size=style.LARGE_ICON_SIZE,
+                    stroke_color=style.COLOR_BUTTON_GREY.get_svg(),
+                    fill_color=style.COLOR_SELECTION_GREY.get_svg())
 
-        box.pack_start(icon, expand=True, fill=False, padding=0)
+        box.append(icon)
         icon.show()
+
+        self.progress_bar = Gtk.ProgressBar()
+        box.append(self.progress_bar)
+        self.progress_bar.show()
 
         label = Gtk.Label()
         color = style.COLOR_BUTTON_GREY.get_html()
         label.set_markup('<span weight="bold" color="%s">%s</span>' % (
             color, GLib.markup_escape_text(message)))
-        box.pack_start(label, expand=True, fill=False, padding=0)
+        box.append(label)
         label.show()
 
-        button_box = Gtk.HButtonBox()
-        button_box.set_layout(Gtk.ButtonBoxStyle.CENTER)
-        box.pack_start(button_box, False, True, 0)
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        button_box.set_halign(Gtk.Align.CENTER)
+        box.append(button_box)
         button_box.show()
 
-        button = Gtk.Button(label=_('Cancel'))
+        button = Gtk.Button()
         button.connect('clicked', button_callback)
-        button.props.image = Icon(icon_name='dialog-cancel',
-                                  pixel_size=style.SMALL_ICON_SIZE)
-        button_box.pack_start(button, expand=True, fill=False, padding=0)
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_box.append(Icon(icon_name='dialog-cancel',
+                            pixel_size=style.SMALL_ICON_SIZE))
+        btn_box.append(Gtk.Label(label=_('Cancel')))
+        button.set_child(btn_box)
+        button_box.append(button)
         button.show()
 
 
-class PDFErrorMessageBox(Gtk.EventBox):
+class PDFErrorMessageBox(Gtk.Box):
     def __init__(self, title, message, button_callback):
-        Gtk.EventBox.__init__(self)
+        Gtk.Box.__init__(self, orientation=Gtk.Orientation.VERTICAL)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
 
-        self.modify_bg(Gtk.StateType.NORMAL,
-                       style.COLOR_WHITE.get_gdk_color())
+        self.add_css_class('pdf-message-box')
+        # CSS is injected dynamically here instead of sugar-artwork because
+        # the colour value is resolved at runtime from sugar4.graphics.style.
+        white = style.COLOR_WHITE.get_css_rgba()
+        css = f".pdf-message-box {{ background-color: {white}; }}"
+        style.apply_css_to_widget(self, css)
 
-        alignment = Gtk.Alignment.new(0.5, 0.5, 0.1, 0.1)
-        self.add(alignment)
-        alignment.show()
-
-        box = Gtk.VBox()
-        alignment.add(box)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.append(box)
         box.show()
 
         # Get the icon of this activity through the bundle path.
@@ -409,7 +408,7 @@ class PDFErrorMessageBox(Gtk.EventBox):
                     stroke_color=style.COLOR_BUTTON_GREY.get_svg(),
                     fill_color=style.COLOR_TRANSPARENT.get_svg())
 
-        box.pack_start(icon, expand=True, fill=False, padding=0)
+        box.append(icon)
         icon.show()
 
         color = style.COLOR_BUTTON_GREY.get_html()
@@ -417,31 +416,34 @@ class PDFErrorMessageBox(Gtk.EventBox):
         label = Gtk.Label()
         label.set_markup('<span weight="bold" color="%s">%s</span>' % (
             color, GLib.markup_escape_text(title)))
-        box.pack_start(label, expand=True, fill=False, padding=0)
+        box.append(label)
         label.show()
 
         label = Gtk.Label()
         label.set_markup('<span color="%s">%s</span>' % (
             color, GLib.markup_escape_text(message)))
-        box.pack_start(label, expand=True, fill=False, padding=0)
+        box.append(label)
         label.show()
 
-        button_box = Gtk.HButtonBox()
-        button_box.set_layout(Gtk.ButtonBoxStyle.CENTER)
-        box.pack_start(button_box, False, True, 0)
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        button_box.set_halign(Gtk.Align.CENTER)
+        box.append(button_box)
         button_box.show()
 
-        button = Gtk.Button(label=_('Try again'))
+        button = Gtk.Button()
         button.connect('clicked', button_callback)
-        button.props.image = Icon(icon_name='entry-refresh',
-                                  pixel_size=style.SMALL_ICON_SIZE,
-                                  stroke_color=style.COLOR_WHITE.get_svg(),
-                                  fill_color=style.COLOR_TRANSPARENT.get_svg())
-        button_box.pack_start(button, expand=True, fill=False, padding=0)
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_box.append(Icon(icon_name='entry-refresh',
+                            pixel_size=style.SMALL_ICON_SIZE,
+                            stroke_color=style.COLOR_WHITE.get_svg(),
+                            fill_color=style.COLOR_TRANSPARENT.get_svg()))
+        btn_box.append(Gtk.Label(label=_('Try again')))
+        button.set_child(btn_box)
+        button_box.append(button)
         button.show()
 
 
-class PDFTabPage(Gtk.HBox):
+class PDFTabPage(Gtk.Box):
     """Shows a basic PDF viewer, download the file first if the PDF is
     in a remote location.
 
@@ -450,7 +452,7 @@ class PDFTabPage(Gtk.HBox):
     """
 
     def __init__(self, state=None):
-        GObject.GObject.__init__(self)
+        Gtk.Box.__init__(self, orientation=Gtk.Orientation.HORIZONTAL)
         self._browser = DummyBrowser(self)
         self._message_box = None
         self._evince_viewer = None
@@ -483,11 +485,16 @@ class PDFTabPage(Gtk.HBox):
         # download first if file is remote
         elif requested_uri.startswith('http://') or \
                 requested_uri.startswith('https://'):
-            
-            downloads_dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)
-            if downloads_dir == None:
-                downloads_dir = os.path.expanduser("~")
-            local_path = os.path.join(downloads_dir, os.path.basename(requested_uri))
+
+            downloads_dir = GLib.get_user_special_dir(
+                GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+            if downloads_dir is None:
+                downloads_dir = os.path.join(
+                    os.path.expanduser("~"), "Downloads")
+            if not os.path.exists(downloads_dir):
+                os.makedirs(downloads_dir)
+            local_path = os.path.join(
+                downloads_dir, os.path.basename(requested_uri))
 
             if os.path.isfile(local_path):
                 # If file already exists locally, no need to download
@@ -514,7 +521,9 @@ class PDFTabPage(Gtk.HBox):
             self._evince_viewer.disable_journal_button()
 
         self._evince_viewer.show()
-        self.pack_start(self._evince_viewer, True, True, 0)
+        self._evince_viewer.set_hexpand(True)
+        self._evince_viewer.set_vexpand(True)
+        self.append(self._evince_viewer)
 
         # If the PDF has a title, set it as the browse page title,
         # otherwise use the last part of the URI.  Only when the title
@@ -541,41 +550,58 @@ class PDFTabPage(Gtk.HBox):
         self._message_box = PDFProgressMessageBox(
             message=_("Downloading document..."),
             button_callback=self.close_tab)
-        self.pack_start(self._message_box, True, True, 0)
+        self._message_box.set_hexpand(True)
+        self._message_box.set_vexpand(True)
+        self.append(self._message_box)
         self._message_box.show()
 
-        """
-        # Figure out download URI
-        temp_path = os.path.join(activity.get_activity_root(), 'instance')
-        if not os.path.exists(temp_path):
-            os.makedirs(temp_path)
-
-        fd, dest_path = tempfile.mkstemp(dir=temp_path)
-        """
-
-        context = WebKit2.WebContext.get_default()
-        context.connect('download-started', self.__download_started_cb)
+        session = WebKit.NetworkSession.get_default()
+        session.connect('download-started', self.__download_started_cb)
         downloadmanager.ignore_pdf(remote_uri)
 
-    def __download_started_cb(self, context, download):
+    def __download_started_cb(self, session, download):
         self._download = download
         download.connect('failed', self.__download_failed_cb)
         download.connect('finished', self.__download_finished_cb)
         download.connect('received-data', self.__download_received_data_cb)
-        context.disconnect_by_func(self.__download_started_cb)
+        download.connect('decide-destination', self.__decide_destination_cb)
+        session.disconnect_by_func(self.__download_started_cb)
+
+    def __decide_destination_cb(self, download, suggested_filename):
+        import os
+        from gi.repository import GLib
+        downloads_dir = GLib.get_user_special_dir(
+            GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+        if downloads_dir is None:
+            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.exists(downloads_dir):
+            os.makedirs(downloads_dir)
+        local_path = os.path.join(downloads_dir, suggested_filename)
+        download.set_destination(local_path)
+        return True
 
     def __download_received_data_cb(self, download, data_size):
         self._browser.props.estimated_load_progress = \
             self._download.get_estimated_progress()
-        self._message_box.progress_icon.update(
+        self._message_box.progress_bar.set_fraction(
             self._browser.props.estimated_load_progress)
 
     def __download_finished_cb(self, download):
         self._pdf_uri = download.get_destination()
+        if not self._pdf_uri.startswith('file://'):
+            self._pdf_uri = "file://" + self._pdf_uri
         logging.debug('FINISHED %s', self._pdf_uri)
-        self.remove(self._message_box)
-        self._message_box = None
-        self._show_pdf()
+
+        from gi.repository import GLib
+
+        def switch_to_pdf():
+            if self._message_box:
+                self.remove(self._message_box)
+                self._message_box = None
+            self._show_pdf()
+            return False
+
+        GLib.idle_add(switch_to_pdf)
         self._download = None
         self._downloaded_pdf = True
 
@@ -585,15 +611,24 @@ class PDFTabPage(Gtk.HBox):
         title = _('This document could not be loaded')
         self._browser.props.title = title
 
-        if self._message_box is not None:
-            self.remove(self._message_box)
+        from gi.repository import GLib
 
-        self._message_box = PDFErrorMessageBox(
-            title=title,
-            message=_('Please make sure you are connected to the Internet.'),
-            button_callback=self.reload)
-        self.pack_start(self._message_box, True, True, 0)
-        self._message_box.show()
+        def switch_to_error():
+            if self._message_box is not None:
+                self.remove(self._message_box)
+
+            msg = _('Please make sure you are connected to the Internet.')
+            self._message_box = PDFErrorMessageBox(
+                title=title,
+                message=msg,
+                button_callback=self.reload)
+            self._message_box.set_hexpand(True)
+            self._message_box.set_vexpand(True)
+            self.append(self._message_box)
+            self._message_box.show()
+            return False
+
+        GLib.idle_add(switch_to_error)
         self._download = None
 
     def reload(self, button=None):

@@ -17,26 +17,25 @@
 
 import os
 import logging
+import time
 from gettext import gettext as _
 import dbus
 import cairo
 import io
-import tempfile
 
 from gi.repository import Gtk
-from gi.repository import Gdk
 from gi.repository import GdkPixbuf
 from gi.repository import GObject
 from gi.repository import Gio
 
-from sugar3.datastore import datastore
-from sugar3 import profile
-from sugar3.graphics.alert import Alert, TimeoutAlert
-from sugar3.graphics.icon import Icon
-from sugar3.activity import activity
+from sugar4.datastore import datastore
+from sugar4 import profile
+from sugar4.graphics.alert import Alert, TimeoutAlert
+from sugar4.graphics.icon import Icon
+from sugar4.activity import activity
 
 try:
-    from sugar3.activity.activity import launch_bundle, get_bundle
+    from sugar4.activity.activity import launch_bundle, get_bundle
     _HAS_BUNDLE_LAUNCHER = True
 except ImportError:
     _HAS_BUNDLE_LAUNCHER = False
@@ -102,6 +101,7 @@ class Download(object):
         self._object_id = None
         self._start_alert = None
         self._stop_alert = None
+        self._failed = False
 
         self._dest_path = ''
         self._progress = 0
@@ -147,13 +147,13 @@ class Download(object):
                 path=self.temp_path) - SPACE_THRESHOLD) \
                 / 1024.0 ** 2
             filename = response.get_suggested_filename()
-            self._canceled_alert.props.msg = \
-                _('Download "%{filename}" requires %{total_size_in_mb}'
-                  ' MB of free space, only %{free_space_in_mb} MB'
-                  ' is available' %
-                  {'filename': filename,
-                   'total_size_in_mb': format_float(total_size_mb),
-                   'free_space_in_mb': format_float(free_space_mb)})
+            msg = _('Download "%(filename)s" requires %(total_size_in_mb)s'
+                    ' MB of free space, only %(free_space_in_mb)s MB'
+                    ' is available')
+            self._canceled_alert.props.msg = msg % {
+                'filename': filename,
+                'total_size_in_mb': format_float(total_size_mb),
+                'free_space_in_mb': format_float(free_space_mb)}
             ok_icon = Icon(icon_name='dialog-ok')
             self._canceled_alert.add_button(Gtk.ResponseType.OK,
                                             _('Ok'), ok_icon)
@@ -176,25 +176,36 @@ class Download(object):
         self._start_alert.show()
 
         self._suggested_filename = suggested_filename
-        # figure out download URI
-        self._dest_path = tempfile.mktemp(
-            dir=self.temp_path, suffix=suggested_filename,
-            prefix='tmp')
-        logging.debug('Download destination path: %s' % self._dest_path)
-        self._download.set_destination('file://' + self._dest_path)
-        logging.debug('Download destination URI: %s', self._download.get_destination())
+        unique_id = str(int(time.time() * 1000))
+        self._dest_path = os.path.join(
+            self.temp_path, f'tmp_{unique_id}_{suggested_filename}')
+
+        logging.debug('Download destination path: %s', self._dest_path)
+        self._download.set_destination(self._dest_path)
+        dest = self._download.get_destination()
+        logging.debug('Download destination URI: %s', dest)
         return True
 
     def __created_destination_cb(self, download, dest):
         logging.debug('__created_destination_cb at %s', dest)
-        self._create_journal_object()
-        self._object_id = self.dl_jobject.object_id
+        try:
+            self._create_journal_object()
+            if self.dl_jobject:
+                self._object_id = self.dl_jobject.object_id
+        except Exception as e:
+            logging.error('Failed to create journal object: %s', e)
+            self.dl_jobject = None
+            self._object_id = None
 
     def _update_progress(self):
         if self._progress > self._last_update_progress:
             self._last_update_progress = self._progress
-            self.dl_jobject.metadata['progress'] = str(self._progress)
-            datastore.write(self.dl_jobject)
+            if self.dl_jobject is not None:
+                self.dl_jobject.metadata['progress'] = str(self._progress)
+                try:
+                    datastore.write(self.dl_jobject)
+                except Exception as e:
+                    logging.warning('Failed to update datastore: %s', e)
 
         self._progress_sid = None
         return False
@@ -213,33 +224,40 @@ class Download(object):
         if self._progress_sid is not None:
             GObject.source_remove(self._progress_sid)
 
-        if self.dl_jobject is None:
+        if self._failed:
             return  # the "failed" signal was observed
 
-        self.dl_jobject.metadata['title'] = self._suggested_filename
-        self.dl_jobject.metadata['description'] = _('From: %s') \
-            % self._source
-        self.dl_jobject.metadata['progress'] = '100'
-        self.dl_jobject.file_path = self._dest_path
+        if self.dl_jobject is not None:
+            self.dl_jobject.metadata['title'] = self._suggested_filename
+            self.dl_jobject.metadata['description'] = _('From: %s') \
+                % self._source
+            self.dl_jobject.metadata['progress'] = '100'
+            self.dl_jobject.file_path = self._dest_path
 
-        mime_type = Gio.content_type_guess(self._dest_path)[0]
-        if mime_type != 'application/vnd.olpc-sugar':
-            mime_type = download.get_response().get_mime_type()
+            mime_type = Gio.content_type_guess(self._dest_path)[0]
+            if mime_type != 'application/vnd.olpc-sugar':
+                mime_type = download.get_response().get_mime_type()
 
-        self.dl_jobject.metadata['mime_type'] = mime_type
+            self.dl_jobject.metadata['mime_type'] = mime_type
 
-        if mime_type in ('image/bmp', 'image/gif', 'image/jpeg',
-                         'image/png', 'image/tiff'):
-            preview = self._get_preview()
-            if preview is not None:
-                self.dl_jobject.metadata['preview'] = \
-                    dbus.ByteArray(preview)
+            if mime_type in ('image/bmp', 'image/gif', 'image/jpeg',
+                             'image/png', 'image/tiff'):
+                preview = self._get_preview()
+                if preview is not None:
+                    self.dl_jobject.metadata['preview'] = \
+                        dbus.ByteArray(preview)
 
-        datastore.write(self.dl_jobject,
-                        transfer_ownership=True,
-                        reply_handler=self.__internal_save_cb,
-                        error_handler=self.__internal_error_cb,
-                        timeout=360)
+            try:
+                datastore.write(self.dl_jobject,
+                                transfer_ownership=True,
+                                reply_handler=self.__internal_save_cb,
+                                error_handler=self.__internal_error_cb,
+                                timeout=360)
+            except Exception as e:
+                logging.error('Error saving to datastore: %s', e)
+                self.__internal_save_cb()
+        else:
+            self.__internal_save_cb()
 
         if self._start_alert is not None:
             self._activity.remove_alert(self._start_alert)
@@ -248,17 +266,21 @@ class Download(object):
         self._stop_alert.props.msg = self._suggested_filename
 
         bundle = None
-        if _HAS_BUNDLE_LAUNCHER:
+        if _HAS_BUNDLE_LAUNCHER and self._object_id:
             bundle = get_bundle(object_id=self._object_id)
 
         if bundle is not None:
             icon = Icon(file=bundle.get_icon())
             label = _('Open with %s') % bundle.get_name()
             response_id = Gtk.ResponseType.APPLY
-        else:
+        elif self._object_id:
             icon = Icon(icon_name='zoom-activity')
             label = _('Show in Journal')
             response_id = Gtk.ResponseType.ACCEPT
+        else:
+            icon = Icon(icon_name='document-save')
+            label = _('Downloaded')
+            response_id = Gtk.ResponseType.OK
 
         self._stop_alert.add_button(response_id, label, icon)
         icon.show()
@@ -272,8 +294,8 @@ class Download(object):
         self._stop_alert.show()
 
     def __download_failed_cb(self, download, error):
-        logging.error('Error downloading URI due to %s'
-                      % error)
+        logging.error('Error downloading URI due to %s', error)
+        self._failed = True
         self.cleanup()
 
     def __internal_save_cb(self):
@@ -281,17 +303,17 @@ class Download(object):
         self.cleanup()
 
     def __internal_error_cb(self, err):
-        logging.debug('Error saving activity object to datastore: %s' % err)
+        logging.debug('Error saving activity object to datastore: %s', err)
         self.cleanup()
 
     def __start_response_cb(self, alert, response_id):
-        if response_id is Gtk.ResponseType.CANCEL:
+        if response_id == Gtk.ResponseType.CANCEL:
             logging.debug('Download Canceled')
             self.cancel()
             try:
                 datastore.delete(self._object_id)
             except Exception as e:
-                logging.warning('Object has been deleted already %s' % e)
+                logging.warning('Object has been deleted already %s', e)
 
             self.cleanup()
             if self._stop_alert is not None:
@@ -308,7 +330,6 @@ class Download(object):
         self._activity.remove_alert(alert)
 
     def cleanup(self):
-        global _active_downloads
         if self in _active_downloads:
             _active_downloads.remove(self)
 
@@ -370,18 +391,26 @@ class Download(object):
         self.dl_jobject.file_path = self._dest_path
         datastore.write(self.dl_jobject)
 
-        bus = dbus.SessionBus()
-        obj = bus.get_object(DS_DBUS_SERVICE, DS_DBUS_PATH)
-        datastore_dbus = dbus.Interface(obj, DS_DBUS_INTERFACE)
-        self.datastore_deleted_handler = datastore_dbus.connect_to_signal(
-            'Deleted', self.__datastore_deleted_cb,
-            arg0=self.dl_jobject.object_id)
+        try:
+            bus = dbus.SessionBus()
+            obj = bus.get_object(DS_DBUS_SERVICE, DS_DBUS_PATH)
+            datastore_dbus = dbus.Interface(obj, DS_DBUS_INTERFACE)
+            self.datastore_deleted_handler = datastore_dbus.connect_to_signal(
+                'Deleted', self.__datastore_deleted_cb,
+                arg0=self.dl_jobject.object_id)
+        except Exception as e:
+            logging.warning('Could not connect to datastore DBus: %s', e)
 
     def _get_preview(self):
-        # This code borrows from sugar3.activity.Activity.get_preview
+        # This code borrows from sugar4.activity.Activity.get_preview
         # to make the preview with cairo, and also uses GdkPixbuf to
         # load any GdkPixbuf supported format.
-        pixbuf = GdkPixbuf.Pixbuf.new_from_file(self._dest_path)
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(self._dest_path)
+        except Exception as e:
+            logging.error('Failed to load image for preview: %s', e)
+            return None
+
         image_width = pixbuf.get_width()
         image_height = pixbuf.get_height()
 
@@ -403,8 +432,14 @@ class Download(object):
         cr.set_source_rgba(1, 1, 1, 0)
         cr.set_operator(cairo.OPERATOR_SOURCE)
         cr.paint()
-        Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
-        cr.paint()
+        success, buffer = pixbuf.save_to_bufferv("png", [], [])
+        if success:
+            png_file = io.BytesIO(buffer)
+            surface = cairo.ImageSurface.create_from_png(png_file)
+            cr.set_source_surface(surface, 0, 0)
+            cr.paint()
+        else:
+            return None
 
         preview_str = io.BytesIO()
         preview_surface.write_to_png(preview_str)
@@ -413,7 +448,6 @@ class Download(object):
     def __datastore_deleted_cb(self, uid):
         logging.debug('Downloaded entry has been deleted'
                       ' from the datastore: %r', uid)
-        global _active_downloads
         if self in _active_downloads:
             self.cancel()
             self.cleanup()

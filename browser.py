@@ -31,14 +31,14 @@ from gi.repository import Gtk
 from gi.repository import GLib
 from gi.repository import Gdk
 from gi.repository import Pango
-from gi.repository import WebKit2
+from gi.repository import WebKit
 from gi.repository import Soup
 from gi.repository import Gio
 
-from sugar3.activity.activity import get_bundle_path, get_activity_root
-from sugar3.graphics import style
-from sugar3.graphics.icon import Icon
-from sugar3.graphics.alert import Alert, ConfirmationAlert
+from sugar4.activity.activity import get_bundle_path, get_activity_root
+from sugar4.graphics import style
+from sugar4.graphics.icon import Icon
+from sugar4.graphics.alert import Alert, ConfirmationAlert
 
 from widgets import BrowserNotebook
 from palettes import ContentInvoker
@@ -55,12 +55,12 @@ _WEB_SCHEMES = ['http', 'https', 'ftp', 'file', 'javascript', 'data',
                 'about', 'gopher', 'mailto']
 
 _NON_SEARCH_REGEX = re.compile('''
-    (^localhost(\\.[^\s]+)?(:\\d+)?(/.*)?$|
+    (^localhost(\\.[^\\s]+)?(:\\d+)?(/.*)?$|
     ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]$|
     ^::[0-9a-f:]*$|                         # IPv6 literals
     ^[0-9a-f:]+:[0-9a-f:]*$|                # IPv6 literals
-    ^[^\\.\s]+\\.[^\\.\s]+.*$|              # foo.bar...
-    ^https?://[^/\\.\s]+.*$|
+    ^[^\\.\\s]+\\.[^\\.\\s]+.*$|              # foo.bar...
+    ^https?://[^/\\.\\s]+.*$|
     ^about:.*$|
     ^data:.*$|
     ^file:.*$)
@@ -145,14 +145,12 @@ class TabbedView(BrowserNotebook):
         self._activity = activity
         BrowserNotebook.__init__(self)
         self.settings = _get_local_settings(activity)
-        self.props.show_border = False
         self.props.scrollable = True
 
         # Used to connect and disconnect functions when 'switch-page'
         self._browser = None
         self._load_status_changed_hid = None
 
-        self.connect('size-allocate', self.__size_allocate_cb)
         self.connect('page-added', self.__page_added_cb)
         self.connect('page-removed', self.__page_removed_cb)
 
@@ -232,9 +230,6 @@ class TabbedView(BrowserNotebook):
 
         return effective_url
 
-    def __size_allocate_cb(self, widget, allocation):
-        self._update_tab_sizes()
-
     def __page_added_cb(self, notebook, child, pagenum):
         self._update_closing_buttons()
         self._update_tab_sizes()
@@ -268,10 +263,9 @@ class TabbedView(BrowserNotebook):
         self._add_tab_page_and_label(new_browser, -1)
         self.set_current_page(next_index - 1)
         new_browser.load_uri(url)
-        new_browser.grab_focus()
 
-    def __create_web_view_cb(self, web_view, frame):
-        new_web_view = Browser(self._activity)
+    def __create_web_view_cb(self, web_view, navigation_action):
+        new_web_view = Browser(self._activity, related_view=web_view)
         new_web_view.connect('ready-to-show', self.__web_view_ready_cb)
         return new_web_view
 
@@ -279,7 +273,7 @@ class TabbedView(BrowserNotebook):
         """
         Handle new window requested and open it in a new tab.
 
-        This callback is called when the WebKit2.WebView request for a
+        This callback is called when the WebKit.WebView request for a
         new window to open (for example a call to the Javascript
         function 'window.open()' or target="_blank")
 
@@ -291,7 +285,7 @@ class TabbedView(BrowserNotebook):
         """
 
         web_view.connect('new-tab', self.__new_tab_cb)
-        web_view.connect('web-process-crashed', self.__crashed_cb)
+        web_view.connect('web-process-terminated', self.__crashed_cb)
         web_view.connect('open-pdf', self.__open_pdf_in_new_tab_cb)
         web_view.connect('create', self.__create_web_view_cb)
         web_view.connect('enter-fullscreen', self.__enter_fullscreen_cb)
@@ -302,11 +296,11 @@ class TabbedView(BrowserNotebook):
 
     def __enter_fullscreen_cb(self, browser):
         self.props.show_tabs = False
-        browser.get_toplevel().fullscreen()
+        browser.get_root().fullscreen()
 
     def __leave_fullscreen_cb(self, browser):
-        # Tab showing done by toplevel
-        browser.get_toplevel().unfullscreen()
+        # Tab showing done by root window
+        browser.get_root().unfullscreen()
 
     def __open_pdf_in_new_tab_cb(self, browser, url):
         tab_page = PDFTabPage()
@@ -324,7 +318,7 @@ class TabbedView(BrowserNotebook):
         tab_page.setup(url)
 
     def __load_changed_cb(self, widget, status):
-        if self.get_window() is None:
+        if not self.get_realized():
             return
 
         if not hasattr(self._activity, 'busy'):
@@ -336,11 +330,24 @@ class TabbedView(BrowserNotebook):
             while self._activity.unbusy() > 0:
                 continue
 
-    def __crashed_cb(self, browser):
+    def __crashed_cb(self, browser, reason):
         self._activity.unbusy()
         uri = browser.cached_uri
-        logging.error('WebKit2 WebView at uri %r has crashed', uri)
-        self.close_tab(browser.get_parent())
+
+        reason_name = getattr(reason, 'value_nick', getattr(
+            reason, 'value_name', str(reason)))
+        logging.error('WebKit WebView at uri %r has terminated with reason %s',
+                      uri, reason_name)
+
+        tab_page = None
+        for i in range(self.get_n_pages()):
+            page = self.get_nth_page(i)
+            if page.browser == browser:
+                tab_page = page
+                break
+
+        if tab_page:
+            self.close_tab(tab_page)
 
         alert = Alert(title=_('This tab has crashed Browse: %s') % uri,
                       msg=_('If you reopen the tab, it may just crash again'))
@@ -354,13 +361,13 @@ class TabbedView(BrowserNotebook):
 
         if response_id == Gtk.ResponseType.OK:
             browser = self.add_tab()
-            browser.props.uri = uri
+            browser.load_uri(uri)
 
     def _create_new_browser(self):
         new_browser = Browser(self._activity)
         new_browser.connect('new-tab', self.__new_tab_cb)
         new_browser.connect('new-tab-background', self.__new_tab_background_cb)
-        new_browser.connect('web-process-crashed', self.__crashed_cb)
+        new_browser.connect('web-process-terminated', self.__crashed_cb)
         new_browser.connect('enter-fullscreen', self.__enter_fullscreen_cb)
         new_browser.connect('leave-fullscreen', self.__leave_fullscreen_cb)
         new_browser.connect('open-pdf', self.__open_pdf_in_new_tab_cb)
@@ -402,10 +409,11 @@ class TabbedView(BrowserNotebook):
             tab_page.cancel_download()
 
         # ensure that a tab opened because of click on
-        # <a href="something" target="name">this</a>
+        # We need to unparent the webview, so that the tab
         # can be closed and then opened again
         # (WebKit is keeping the WebView object alive)
-        tab_page.props.browser.destroy()
+        if tab_page.browser is not None and hasattr(tab_page, 'set_child'):
+            tab_page.set_child(None)
 
         # FIXME: above causes log warnings about signal handlers that
         # were connected to the destroyed WebView object.
@@ -413,33 +421,42 @@ class TabbedView(BrowserNotebook):
         self.remove_page(self.page_num(tab_page))
 
         current_page = self.get_nth_page(self.get_current_page())
-        current_page.props.browser.grab_focus()
+        if current_page.browser is not None:
+            current_page.browser.grab_focus()
 
     def __tab_close_cb(self, label, tab_page):
         self.close_tab(tab_page)
 
-    def _update_tab_sizes(self):
-        """Update tab widths based in the amount of tabs."""
+    def do_size_allocate(self, width, height, baseline):
+        super().do_size_allocate(width, height, baseline)
+        self._update_tab_sizes(width)
 
+    def _update_tab_sizes(self, allowed_size=None):
+        """Update tab widths based in the amount of tabs."""
         n_pages = self.get_n_pages()
-        canvas_size = self.get_allocation()
-        allowed_size = canvas_size.width
+        if n_pages == 0:
+            return
+
+        if allowed_size is None:
+            allowed_size = self.get_width()
+
+        if allowed_size <= 0:
+            return
+
         if n_pages == 1:
-            # use half of the whole space
             tab_expand = False
             tab_new_size = int(allowed_size / 2)
-        elif n_pages <= 8:  # ensure eight tabs
-            tab_expand = True  # use all the space available by tabs
+        elif n_pages <= 8:
+            tab_expand = True
             tab_new_size = -1
         else:
-            # scroll the tab toolbar if there are more than 8 tabs
             tab_expand = False
-            tab_new_size = (allowed_size / 8)
+            tab_new_size = int(allowed_size / 8)
 
         for page_idx in range(n_pages):
             page = self.get_nth_page(page_idx)
             label = self.get_tab_label(page)
-            self.child_set_property(page, 'tab-expand', tab_expand)
+            self.get_page(page).props.tab_expand = tab_expand
             label.update_size(tab_new_size)
 
     def _update_closing_buttons(self):
@@ -508,8 +525,9 @@ class TabbedView(BrowserNotebook):
             self.remove_page(self.get_n_pages() - 1)
 
         def is_pdf_history(tab_history):
-            return (len(tab_history) == 1 and
-                    tab_history[0]['url'].lower().endswith('pdf'))
+            if len(tab_history) != 1:
+                return False
+            return tab_history[0]['url'].lower().endswith('pdf')
 
         for tab_history, current in zip(tab_histories, currents):
             if is_pdf_history(tab_history):
@@ -533,6 +551,7 @@ class TabbedView(BrowserNotebook):
                 browser.connect('open-pdf', self.__open_pdf_in_new_tab_cb)
                 browser.connect('ready-to-show', self.__web_view_ready_cb)
                 browser.connect('create', self.__create_web_view_cb)
+                browser.connect('web-process-terminated', self.__crashed_cb)
                 self._append_tab(browser)
                 browser.set_legacy_history(tab_history, current)
 
@@ -575,7 +594,7 @@ class TabbedView(BrowserNotebook):
                 browser.connect('open-pdf', self.__open_pdf_in_new_tab_cb)
                 browser.connect('ready-to-show', self.__web_view_ready_cb)
                 browser.connect('create', self.__create_web_view_cb)
-                browser.connect('web-process-crashed', self.__crashed_cb)
+                browser.connect('web-process-terminated', self.__crashed_cb)
                 self._append_tab(browser)
             else:
                 logging.error('Encountered unknown tab state %r', state)
@@ -590,11 +609,11 @@ class TabPage(Gtk.ScrolledWindow):
     __gtype_name__ = 'BrowseTabPage'
 
     def __init__(self, browser):
-        GObject.GObject.__init__(self)
+        super().__init__()
 
         self._browser = browser
 
-        self.add(browser)
+        self.set_child(browser)
         browser.show()
 
     def _get_browser(self):
@@ -604,7 +623,7 @@ class TabPage(Gtk.ScrolledWindow):
                                getter=_get_browser)
 
 
-class TabLabel(Gtk.HBox):
+class TabLabel(Gtk.Box):
     __gtype_name__ = 'BrowseTabLabel'
 
     __gsignals__ = {
@@ -614,7 +633,7 @@ class TabLabel(Gtk.HBox):
     }
 
     def __init__(self, browser):
-        GObject.GObject.__init__(self)
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
 
         browser.connect('notify::title', self.__title_changed_cb)
         browser.connect('load-changed', self.__load_changed_cb)
@@ -622,20 +641,22 @@ class TabLabel(Gtk.HBox):
         self._title = _('Untitled')
         self._label = Gtk.Label(label=self._title)
         self._label.set_ellipsize(Pango.EllipsizeMode.END)
-        self._label.set_alignment(0, 0.5)
-        self.pack_start(self._label, True, True, 0)
+        self._label.set_xalign(0)
+        self._label.set_yalign(0.5)
+        self._label.set_hexpand(True)
+        self.append(self._label)
         self._label.show()
 
         close_tab_icon = Icon(icon_name='browse-close-tab')
         button = Gtk.Button()
-        button.props.relief = Gtk.ReliefStyle.NONE
+        button.set_has_frame(False)
         button.props.focus_on_click = False
-        icon_box = Gtk.HBox()
-        icon_box.pack_start(close_tab_icon, True, False, 0)
-        button.add(icon_box)
+        icon_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        icon_box.append(close_tab_icon)
+        button.set_child(icon_box)
         button.connect('clicked', self.__button_clicked_cb)
         button.set_name('browse-tab-close')
-        self.pack_start(button, False, True, 0)
+        self.append(button)
         close_tab_icon.show()
         icon_box.show()
         button.show()
@@ -662,7 +683,7 @@ class TabLabel(Gtk.HBox):
         self._title = title
 
     def __load_changed_cb(self, widget, status):
-        if status == WebKit2.LoadEvent.FINISHED:
+        if status == WebKit.LoadEvent.FINISHED:
             if widget.props.title is None:
                 self._label.set_text(_('Untitled'))
                 self._title = _('Untitled')
@@ -672,7 +693,7 @@ class TabLabel(Gtk.HBox):
             self._label.set_text(_('Loading...'))
 
 
-class Browser(WebKit2.WebView):
+class Browser(WebKit.WebView):
     __gtype_name__ = 'Browser'
 
     __gsignals__ = {
@@ -695,8 +716,11 @@ class Browser(WebKit2.WebView):
     SECURITY_STATUS_SECURE = 1
     SECURITY_STATUS_INSECURE = 2
 
-    def __init__(self, activity, state=None):
-        WebKit2.WebView.__init__(self)
+    def __init__(self, activity, state=None, related_view=None):
+        if related_view:
+            WebKit.WebView.__init__(self, related_view=related_view)
+        else:
+            WebKit.WebView.__init__(self)
         self._activity = activity
         web_settings = self.get_settings()
 
@@ -725,14 +749,13 @@ class Browser(WebKit2.WebView):
         self.connect('run-file-chooser', self.__run_file_chooser)
         self.connect('load-failed', self.__load_failed_cb)
 
-        self._inject_media_style = False
         self.props.zoom_level = ZOOM_ORIGINAL
 
         ContentInvoker(self)
 
         if state is not None:
             gbytes = GLib.Bytes(b64decode(state))
-            session_state = WebKit2.WebViewSessionState(gbytes)
+            session_state = WebKit.WebViewSessionState(gbytes)
             self.restore_session_state(session_state)
             # this is what epiphany does:
             # https://github.com/GNOME/epiphany/blob/
@@ -752,7 +775,7 @@ class Browser(WebKit2.WebView):
             # JSON results in utf8-decoding, so it needs to be good data
             return b64encode(gbytes.get_data())
         except BaseException:
-            return ""  # graceful degradation in case of old WebKit2
+            return ""  # graceful degradation in case of old WebKit
 
     def get_legacy_history(self):
         """Return the browsing history of this browser."""
@@ -774,7 +797,7 @@ class Browser(WebKit2.WebView):
         """
         Restore the browsing history for this browser.
 
-        Since the legacy history format is not loadable by WebKit2,
+        Since the legacy history format is not loadable by WebKit,
         this function is DEPRECATED
         """
         current_item = current['history_index']
@@ -797,7 +820,7 @@ class Browser(WebKit2.WebView):
             self.go_to_back_forward_list_item(item)
 
     def _items_history_as_list(self, history):
-        """Return a list with the items of a WebKit2.WebBackForwardList."""
+        """Return a list with the items of a WebKit.WebBackForwardList."""
         all_items = []
 
         for item in reversed(history.get_back_list()):
@@ -813,15 +836,19 @@ class Browser(WebKit2.WebView):
     def get_source(self, async_cb, async_err_cb):
         if self.is_loading():
             async_err_cb()
+            return
 
-        def writer(view, result):
+        def writer(resource, result):
             temp_path = os.path.join(get_activity_root(), 'instance')
             file_path = os.path.join(temp_path, '%i' % time.time())
 
-            file_handle = open(file_path, 'w')
-            file_handle.write(view.get_data_finish(result))
-            file_handle.close()
-            async_cb(file_path)
+            data = resource.get_data_finish(result)
+            if data:
+                with open(file_path, 'wb') as file_handle:
+                    file_handle.write(data.get_data())
+                async_cb(file_path)
+            else:
+                async_err_cb()
 
         self.get_main_resource().get_data(None, writer)
 
@@ -832,28 +859,28 @@ class Browser(WebKit2.WebView):
         self.emit('new-tab-background', url)
 
     def __run_file_chooser(self, browser, request):
-        picker = FilePicker(self)
-        chosen = picker.run()
-        picker.destroy()
+        def on_file_chosen(chosen):
+            if chosen:
+                request.select_files([chosen])
+            elif hasattr(request, 'cancel'):
+                # WebKit only
+                request.cancel()
 
-        if chosen:
-            request.select_files([chosen])
-        elif hasattr(request, 'cancel'):
-            # WebKit2 only
-            request.cancel()
+        picker = FilePicker(self.get_root(), on_file_chosen)
+        picker.present()
         return True
 
     def __load_changed_cb(self, widget, status):
-        if status <= WebKit2.LoadEvent.COMMITTED:
+        if status <= WebKit.LoadEvent.COMMITTED:
             # Add the url to the global history or update it.
             uri = self.get_uri()
             self._global_history.add_page(uri)
 
         self.cached_uri = self.props.uri
 
-        if status == WebKit2.LoadEvent.COMMITTED:
+        if status == WebKit.LoadEvent.COMMITTED:
             # Update the security status.
-            bool_, cert, errors = widget.get_tls_info()
+            _, cert, errors = widget.get_tls_info()
             if cert:
                 if not errors:
                     self.security_status = self.SECURITY_STATUS_SECURE
@@ -874,7 +901,7 @@ class Browser(WebKit2.WebView):
         """Handle downloads and PDF files and
            handles middle-clicking on links"""
 
-        if decision_type == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+        if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
             navigation_action = policy_decision.get_navigation_action()
             request = navigation_action.get_request()
             button = navigation_action.get_mouse_button()
@@ -884,20 +911,17 @@ class Browser(WebKit2.WebView):
                 self.open_new_tab_background(uri)
                 return True
 
-        if decision_type != WebKit2.PolicyDecisionType.RESPONSE:
+        if decision_type != WebKit.PolicyDecisionType.RESPONSE:
             return False
 
-        response = WebKit2.ResponsePolicyDecision.get_response(policy_decision)
-        mimetype = WebKit2.URIResponse.get_mime_type(response)
+        response = WebKit.ResponsePolicyDecision.get_response(policy_decision)
+        mimetype = WebKit.URIResponse.get_mime_type(response)
 
         if mimetype == 'application/pdf':
             self.emit('open-pdf', response.get_uri())
             policy_decision.download()
             self._activity.unbusy()
             return True
-
-        elif mimetype == 'audio/x-vorbis+ogg' or mimetype == 'audio/mpeg':
-            self._inject_media_style = True
 
         elif not self.can_show_mime_type(mimetype):
             policy_decision.download()
@@ -908,26 +932,15 @@ class Browser(WebKit2.WebView):
         return False
 
     def __load_failed_cb(self, web_view, event, uri, web_error):
-        if web_error.code == WebKit2.NetworkError.CANCELLED:
+        if web_error.code == WebKit.NetworkError.CANCELLED:
             # User pressed the stop button - not a real error
             return True
 
         # Don't show error page if the load was interrupted by policy
-        # change or the request is going to be handled by a
-        # plugin. For example, if a file was requested for download or
-        # an .ogg file is going to be played.
-        if web_error.code in (
-                WebKit2.PolicyError.FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE,
-                WebKit2.PluginError.WILL_HANDLE_LOAD):
-            if self._inject_media_style:
-                css_style_file = open(os.path.join(get_bundle_path(),
-                                                   "data/media-controls.css"))
-                css_style = css_style_file.read().replace('\n', '')
-                inject_style_script = \
-                    "var style = document.createElement('style');" \
-                    "style.innerHTML = '%s';" \
-                    "document.body.appendChild(style);" % css_style
-                web_view.execute_script(inject_style_script)
+        # change. (PluginError.WILL_HANDLE_LOAD was removed in WebKit 6.0
+        # as NPAPI plugin support was dropped entirely.)
+        if web_error.code == \
+                WebKit.PolicyError.FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE:
             return True
 
         data = {
@@ -947,11 +960,9 @@ class Browser(WebKit2.WebView):
         return True
 
     def _get_permission_name(self, request):
-        if hasattr(WebKit2, 'GeolocationPermissionRequest') and \
-           isinstance(request, WebKit2.GeolocationPermissionRequest):
+        if isinstance(request, WebKit.GeolocationPermissionRequest):
             return _('receive your location')
-        if hasattr(WebKit2, 'NotificationPermissionRequest') and \
-           isinstance(request, WebKit2.NotificationPermissionRequest):
+        if isinstance(request, WebKit.NotificationPermissionRequest):
             return _('display notifications in the frame')
         # Should never be reached
         return type(request).__name__
@@ -964,14 +975,14 @@ class Browser(WebKit2.WebView):
             site = match.group(1)
 
         alert = ConfirmationAlert()
-        alert.props.title = _('Allow %{site} to %{description}?') % \
+        alert.props.title = _('Allow %(site)s to %(description)s?') % \
             {'site': site, 'description': description}
         alert.props.msg = _(
             'You can change your choice later by reloading the page')
         alert.connect('response', self.__permission_request_alert_cb, request)
         self._activity.add_alert(alert)
 
-        # Allow async handeling
+        # Allow async handling
         return True
 
     def __permission_request_alert_cb(self, alert, response_id, request):
@@ -982,9 +993,6 @@ class Browser(WebKit2.WebView):
         elif response_id == Gtk.ResponseType.CANCEL:
             request.deny()
 
-    def can_query_editing_commands(self):
-        return True
-
     def zoom_in(self):
         self.props.zoom_level = self.props.zoom_level + _ZOOM_AMOUNT
 
@@ -994,20 +1002,21 @@ class Browser(WebKit2.WebView):
 
 class PopupDialog(Gtk.Window):
     def __init__(self):
-        GObject.GObject.__init__(self)
-
-        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
-
+        super().__init__()
         border = style.GRID_CELL_SIZE
-        self.set_default_size(Gdk.Screen.width() - border * 2,
-                              Gdk.Screen.height() - border * 2)
+        display = Gdk.Display.get_default()
+        if display is not None:
+            monitors = display.get_monitors()
+            if monitors.get_n_items() > 0:
+                geom = monitors.get_item(0).get_geometry()
+                self.set_default_size(geom.width - border * 2,
+                                      geom.height - border * 2)
 
-        self.view = WebKit2.WebView()
-        self.view.connect('notify::visibility', self.__notify_visibility_cb)
-        self.add(self.view)
+        self.view = WebKit.WebView()
+        self.view.connect('ready-to-show', self.__ready_to_show_cb)
+        self.set_child(self.view)
         self.view.realize()
 
-    def __notify_visibility_cb(self, web_view, pspec):
-        if self.view.props.visibility:
-            self.view.show()
-            self.show()
+    def __ready_to_show_cb(self, web_view):
+        self.view.show()
+        self.show()
