@@ -844,13 +844,17 @@ class PrimaryToolbar(ToolbarBase):
     def _reload_session_history(self):
         back_forward_list = self._browser.get_back_forward_list()
 
-        # Clear menus in palettes:
-        for box_menu in (self._back_box_menu, self._forward_box_menu):
-            while True:
-                child = box_menu.get_first_child()
-                if not child:
-                    break
-                box_menu.remove(child)
+        self._back_box_menu = PaletteMenuBox()
+        self._back_box_menu.show()
+        self._back.get_palette().set_content(self._back_box_menu)
+        self._back.get_palette()._content.set_margin_start(1)
+        self._back.get_palette()._content.set_margin_end(1)
+
+        self._forward_box_menu = PaletteMenuBox()
+        self._forward_box_menu.show()
+        self._forward.get_palette().set_content(self._forward_box_menu)
+        self._forward.get_palette()._content.set_margin_start(1)
+        self._forward.get_palette()._content.set_margin_end(1)
 
         def create_menu_item(history_item):
             """Create a MenuItem for the back or forward palettes."""
