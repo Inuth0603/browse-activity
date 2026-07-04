@@ -17,6 +17,7 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 import os
+import logging
 from gettext import gettext as _
 
 from gi.repository import GObject
@@ -25,15 +26,15 @@ from gi.repository import GLib
 from gi.repository import Gdk
 from gi.repository import Pango
 
-from sugar3.graphics.toolbutton import ToolButton
-from sugar3.graphics.toggletoolbutton import ToggleToolButton
-from sugar3.graphics import iconentry
-from sugar3.graphics.toolbarbox import ToolbarBox as ToolbarBase
-from sugar3.graphics.palettemenu import PaletteMenuItem
-from sugar3.graphics.palettemenu import PaletteMenuBox
-from sugar3.graphics import style
-from sugar3.activity.widgets import ActivityToolbarButton
-from sugar3.activity.widgets import StopButton
+from sugar4.graphics.toolbutton import ToolButton
+from sugar4.graphics.toggletoolbutton import ToggleToolButton
+from sugar4.graphics import iconentry
+from sugar4.graphics.toolbarbox import ToolbarBox as ToolbarBase
+from sugar4.graphics.palettemenu import PaletteMenuItem
+from sugar4.graphics.palettemenu import PaletteMenuBox
+from sugar4.graphics import style
+from sugar4.activity.widgets import ActivityToolbarButton
+from sugar4.activity.widgets import StopButton
 
 import filepicker
 import places
@@ -48,53 +49,47 @@ _MAX_HISTORY_ENTRIES = 15
 _SEARCH_ENTRY_MARGIN = style.zoom(14)
 
 
-class _SearchWindow(Gtk.Window):
+class _SearchWindow(Gtk.Popover):
     """A search window that can be styled in the theme."""
 
     __gtype_name__ = "BrowseSearchWindow"
 
     def __init__(self):
-        Gtk.Window.__init__(self, type=Gtk.WindowType.POPUP)
-        self.get_style_context().add_class('search-window')
+        super().__init__()
+        self.add_css_class('search-window')
+        self.set_position(Gtk.PositionType.BOTTOM)
+        self.set_has_arrow(False)
 
+        # Scoped CSS injected directly via toolkit helper (uses
+        # PRIORITY_APPLICATION). This prevents CSS namespace pollution
+        # and ensures styles are tightly bound to the widget lifecycle.
+        css = f'''
+        /* TODO: GtkTreeView is deprecated and should eventually
+           be migrated to GtkListView. */
+        .search-window treeview {{
+            background: {style.COLOR_BLACK.get_css_rgba()};
+            color: {style.COLOR_WHITE.get_css_rgba()};
+            border-color: {style.COLOR_BUTTON_GREY.get_css_rgba()};
+            border-width: 0 {style.LINE_WIDTH}px {style.LINE_WIDTH}px \
+                {style.LINE_WIDTH}px;
+            border-style: solid;
+        }}
 
-screen = Gdk.Screen.get_default()
-css_provider = Gtk.CssProvider.get_default()
-css = ('''
-@define-color button_grey #808080;
+        .search-window treeview:selected {{
+            background: {style.COLOR_BUTTON_GREY.get_css_rgba()};
+        }}
 
-.search-window treeview {{
-    background: black;
-    color: white;
-    border-color: @button_grey;
-    border-width: 0 {thickness}px {thickness}px {thickness}px;
-    border-style: solid;
-}}
+        .search-window scrollbar trough {{
+            background: {style.COLOR_BLACK.get_css_rgba()};
+        }}
 
-.search-window treeview:selected {{
-    background: @button_grey;
-}}
-
-.connected-entry {{
-    background: black;
-    border-color: @button_grey;
-    border-width: {thickness}px {thickness}px 0 {thickness}px;
-    border-style: solid;
-}}
-
-.search-window scrollbar trough {{
-    background: black;
-}}
-
-.search-window scrollbar {{
-    border: {thickness}px solid @button_grey;
-    border-left: none;
-}}
-'''.format(thickness=style.LINE_WIDTH))
-css_provider.load_from_data(css.encode('utf-8'))
-context = Gtk.StyleContext()
-context.add_provider_for_screen(screen, css_provider,
-                                Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        .search-window scrollbar {{
+            border: {style.LINE_WIDTH}px solid \
+                {style.COLOR_BUTTON_GREY.get_css_rgba()};
+            border-left: none;
+        }}
+        '''
+        style.apply_css_to_widget(self, css)
 
 
 class WebEntry(iconentry.IconEntry):
@@ -102,26 +97,32 @@ class WebEntry(iconentry.IconEntry):
     _COL_TITLE = 0
 
     def __init__(self):
-        GObject.GObject.__init__(self)
+        super().__init__()
 
         self._address = None
         self._search_view = self._search_create_view()
 
         self._search_window = _SearchWindow()
+        self._search_window.set_parent(self)
         self._search_window_scroll = Gtk.ScrolledWindow()
         self._search_window_scroll.set_policy(Gtk.PolicyType.NEVER,
                                               Gtk.PolicyType.AUTOMATIC)
         self._search_window_scroll.set_min_content_height(200)
-        self._search_window_scroll.add(self._search_view)
-        self._search_window.add(self._search_window_scroll)
+        self._search_window_scroll.set_child(self._search_view)
+        self._search_window.set_child(self._search_window_scroll)
         self._search_view.show()
         self._search_window_scroll.show()
 
-        self.connect('focus-in-event', self.__focus_in_event_cb)
-        self.connect('populate-popup', self.__populate_popup_cb)
-        self.connect('key-press-event', self.__key_press_event_cb)
-        self._focus_out_hid = self.connect(
-            'focus-out-event', self.__focus_out_event_cb)
+        self._popdown_timeout_id = None
+
+        focus_controller = Gtk.EventControllerFocus()
+        focus_controller.connect('enter', self.__focus_in_event_cb)
+        focus_controller.connect('leave', self.__focus_out_event_cb)
+        self.add_controller(focus_controller)
+
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect('key-pressed', self.__key_press_event_cb)
+        self.add_controller(key_controller)
         self._change_hid = self.connect('changed', self.__changed_cb)
 
     def _set_text(self, text):
@@ -134,8 +135,11 @@ class WebEntry(iconentry.IconEntry):
             self.handler_unblock(self._change_hid)
 
     def activate(self, uri):
+        if self._popdown_timeout_id:
+            GLib.source_remove(self._popdown_timeout_id)
+            self._popdown_timeout_id = None
         self._set_text(uri)
-        self._search_popdown()
+        self.search_popdown()
         self.emit('activate')
 
     def _set_address(self, address):
@@ -149,7 +153,10 @@ class WebEntry(iconentry.IconEntry):
         view = Gtk.TreeView()
         view.props.headers_visible = False
 
-        view.connect('button-press-event', self.__view_button_press_event_cb)
+        click_gesture = Gtk.GestureClick()
+        click_gesture.set_button(0)
+        click_gesture.connect('pressed', self.__view_button_press_event_cb)
+        view.add_controller(click_gesture)
 
         column = Gtk.TreeViewColumn()
         view.append_column(column)
@@ -180,48 +187,81 @@ class WebEntry(iconentry.IconEntry):
         return len(list_store) > 0
 
     def _search_popup(self):
-        miss, window_x, window_y = self.props.window.get_origin()
-        entry_allocation = self.get_allocation()
-        preferred_height = self.get_preferred_height()[0]
-        gap = (entry_allocation.height - preferred_height) / 2
-
-        search_x = window_x + entry_allocation.x
-        search_y = window_y + gap + preferred_height
-        search_width = entry_allocation.width
+        search_width = self.get_width()
         # Set minimun height to four entries.
         search_height = (style.STANDARD_ICON_SIZE + style.LINE_WIDTH * 2) * 4
 
-        self._search_window.move(search_x, search_y)
-        self._search_window.resize(search_width, search_height)
-        self._search_window.show()
+        # Popovers size relative to parent automatically.
+        # To enforce minimum height and exact width, we use size_request if
+        # width is valid.
+        if search_width > 1:
+            self._search_window.set_size_request(search_width, search_height)
+        else:
+            self._search_window.set_size_request(-1, search_height)
 
-        self.get_parent().get_style_context().add_class('connected-entry')
-        self.get_parent().queue_draw()
+        self._search_window.popup()
 
-    def _search_popdown(self):
-        self._search_window.hide()
-        self.get_parent().get_style_context().remove_class('connected-entry')
-        self.get_parent().queue_draw()
+        parent = self.get_parent()
+        if parent:
+            parent.add_css_class('connected-entry')
+            # Scoped CSS injection to avoid display-wide pollution.
+            # Guarded to prevent leaking new CssProviders on every keystroke
+            # when popup opens.
+            if not getattr(parent, '_connected_entry_css_applied', False):
+                css = f'''
+                .connected-entry {{
+                    background: {style.COLOR_BLACK.get_css_rgba()};
+                    border-color: {style.COLOR_BUTTON_GREY.get_css_rgba()};
+                    border-width: {style.LINE_WIDTH}px {style.LINE_WIDTH}px \
+                        0 {style.LINE_WIDTH}px;
+                    border-style: solid;
+                }}
+                '''
+                style.apply_css_to_widget(parent, css)
+                parent._connected_entry_css_applied = True
+            parent.queue_draw()
 
-    def __focus_in_event_cb(self, entry, event):
-        self._search_popdown()
+    def search_popdown(self):
+        self._search_window.popdown()
+        parent = self.get_parent()
+        if parent:
+            parent.remove_css_class('connected-entry')
+            parent.queue_draw()
 
-    def __focus_out_event_cb(self, entry, event):
-        self._search_popdown()
+    def __focus_in_event_cb(self, controller):
+        if self._popdown_timeout_id:
+            GLib.source_remove(self._popdown_timeout_id)
+            self._popdown_timeout_id = None
 
-    def __view_button_press_event_cb(self, view, event):
+    def __focus_out_event_cb(self, controller):
+        # Standard entry context menus don't fire disruptive focus-out events
+        # on the parent, so defer popdown to prevent closing the dropdown.
+        # (Warrants interactive testing).
+        self._popdown_timeout_id = GLib.timeout_add(50, self._deferred_popdown)
+
+    def _deferred_popdown(self):
+        self._popdown_timeout_id = None
+        self.search_popdown()
+        return GLib.SOURCE_REMOVE
+
+    def __view_button_press_event_cb(self, gesture, n_press, x, y):
+        view = gesture.get_widget()
         model = view.get_model()
 
-        path, col_, x_, y_ = view.get_path_at_pos(int(event.x), int(event.y))
-        if path:
+        result = view.get_path_at_pos(int(x), int(y))
+        if result is not None:
+            path, col_, x_, y_ = result
             uri = model[path][self._COL_ADDRESS]
             self.activate(uri)
 
-    def __key_press_event_cb(self, entry, event):
+    def __key_press_event_cb(self, controller, keyval, keycode, state):
         selection = self._search_view.get_selection()
         model, selected = selection.get_selected()
 
-        if event.keyval in (Gdk.KEY_uparrow, Gdk.KEY_Up):
+        if len(model) == 0:
+            return False
+
+        if keyval in (Gdk.KEY_uparrow, Gdk.KEY_Up):
             if selected is None:
                 selection.select_iter(model[-1].iter)
                 self._set_text(model[-1][0])
@@ -233,7 +273,7 @@ class WebEntry(iconentry.IconEntry):
             self.set_vadjustments(selection)
             return True
 
-        if event.keyval in (Gdk.KEY_downarrow, Gdk.KEY_Down):
+        if keyval in (Gdk.KEY_downarrow, Gdk.KEY_Down):
             if selected is None:
                 down_iter = model.get_iter_first()
             else:
@@ -244,15 +284,15 @@ class WebEntry(iconentry.IconEntry):
             self.set_vadjustments(selection)
             return True
 
-        if event.keyval == Gdk.KEY_Return:
+        if keyval == Gdk.KEY_Return:
             if selected is None:
                 return False
             uri = model[model.get_path(selected)][self._COL_ADDRESS]
             self.activate(uri)
             return True
 
-        if event.keyval == Gdk.KEY_Escape:
-            self._search_window.hide()
+        if keyval == Gdk.KEY_Escape:
+            self._search_window.popdown()
             self.props.text = ''
             return True
 
@@ -261,47 +301,55 @@ class WebEntry(iconentry.IconEntry):
     def set_vadjustments(self, selection):
         # Sets the vertical adjustments of the scrolled window
         # on 'Up'/'Down' keypress
-        path = (selection.get_selected_rows()[1])[0]
+        rows = selection.get_selected_rows()[1]
+        if not rows:
+            return
+        path = rows[0]
         index = path.get_indices()[0]
         adjustment = self._search_window_scroll.get_vadjustment()
         step = style.STANDARD_ICON_SIZE
         adjustment.set_value(step * index)
         self._search_window_scroll.set_vadjustment(adjustment)
 
-    def __popup_unmap_cb(self, entry):
-        self.handler_unblock(self._focus_out_hid)
-
-    def __populate_popup_cb(self, entry, menu):
-        self.handler_block(self._focus_out_hid)
-        menu.connect('unmap', self.__popup_unmap_cb)
-
     def __changed_cb(self, entry):
         self._address = self.props.text
 
         if not self.props.text or not self._search_update():
-            self._search_popdown()
+            self.search_popdown()
         else:
             self._search_popup()
 
+    def do_dispose(self):
+        if self._popdown_timeout_id is not None:
+            GLib.source_remove(self._popdown_timeout_id)
+            self._popdown_timeout_id = None
+        if self._search_window.get_parent():
+            self._search_window.unparent()
+        super().do_dispose()
 
-class UrlToolbar(Gtk.EventBox):
+
+class UrlToolbar(Gtk.Box):
     # This is used for the URL entry in portrait mode.
 
     def __init__(self):
-        Gtk.EventBox.__init__(self)
-        self.modify_bg(Gtk.StateType.NORMAL,
-                       style.COLOR_TOOLBAR_GREY.get_gdk_color())
+        Gtk.Box.__init__(self)
+        self.add_css_class('url-toolbar')
 
-        url_alignment = Gtk.Alignment(xscale=1.0, yscale=1.0)
-        url_alignment.set_padding(0, 0, style.LINE_WIDTH * 4,
-                                  style.LINE_WIDTH * 4)
+        # Scoped CSS injection to avoid display-wide namespace pollution.
+        css = f'''
+        .url-toolbar {{
+            background: {style.COLOR_TOOLBAR_GREY.get_css_rgba()};
+        }}
+        '''
+        style.apply_css_to_widget(self, css)
 
-        self.add(url_alignment)
-        url_alignment.show()
-
-        self.toolbar = Gtk.Toolbar()
+        self.toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.toolbar.set_margin_start(style.LINE_WIDTH * 4)
+        self.toolbar.set_margin_end(style.LINE_WIDTH * 4)
+        self.toolbar.set_hexpand(True)
+        self.toolbar.set_vexpand(True)
         self.toolbar.set_size_request(-1, style.GRID_CELL_SIZE)
-        url_alignment.add(self.toolbar)
+        self.append(self.toolbar)
         self.toolbar.show()
 
 
@@ -320,6 +368,7 @@ class PrimaryToolbar(ToolbarBase):
     def __init__(self, tabbed_view, act):
         ToolbarBase.__init__(self)
 
+        self._configuring_toolbar = False
         self._url_toolbar = UrlToolbar()
 
         self._activity = act
@@ -333,20 +382,20 @@ class PrimaryToolbar(ToolbarBase):
 
         toolbar = self.toolbar
         activity_button = ActivityToolbarButton(self._activity)
-        toolbar.insert(activity_button, 0)
+        toolbar.prepend(activity_button)
 
-        separator = Gtk.SeparatorToolItem()
+        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
 
         '''
         Disabled since the python gi bindings don't expose the critical
-        WebKit2.PrintOperation.print function
+        WebKit.PrintOperation.print function
 
         save_as_pdf = ToolButton('save-as-pdf')
         save_as_pdf.set_tooltip(_('Save page as pdf'))
         save_as_pdf.connect('clicked', self.save_as_pdf)
 
-        activity_button.props.page.insert(separator, -1)
-        activity_button.props.page.insert(save_as_pdf, -1)
+        activity_button.props.page.append(separator)
+        activity_button.props.page.append(save_as_pdf)
         separator.show()
         save_as_pdf.show()
         '''
@@ -354,8 +403,8 @@ class PrimaryToolbar(ToolbarBase):
         inspect_view.set_tooltip(_('Show Web Inspector'))
         inspect_view.connect('clicked', self.inspect_view)
 
-        activity_button.props.page.insert(separator, -1)
-        activity_button.props.page.insert(inspect_view, -1)
+        activity_button.props.page.append(separator)
+        activity_button.props.page.append(inspect_view)
         separator.show()
         inspect_view.show()
 
@@ -364,30 +413,30 @@ class PrimaryToolbar(ToolbarBase):
         self._go_home.connect('clicked', self._go_home_cb)
         # add a menu to save the home page
         menu_box = PaletteMenuBox()
-        self._go_home.props.palette.set_content(menu_box)
+        self._go_home.get_palette().set_content(menu_box)
         menu_item = PaletteMenuItem()
         menu_item.set_label(_('Select as initial page'))
-        menu_item.connect('activate', self._set_home_cb)
+        menu_item.connect('clicked', self._set_home_cb)
         menu_box.append_item(menu_item)
 
         self._reset_home_menu = PaletteMenuItem()
         self._reset_home_menu.set_label(_('Reset initial page'))
-        self._reset_home_menu.connect('activate', self._reset_home_cb)
+        self._reset_home_menu.connect('clicked', self._reset_home_cb)
         menu_box.append_item(self._reset_home_menu)
 
         if os.path.isfile(LIBRARY_PATH):
             library_menu = PaletteMenuItem()
             library_menu.set_label(_('Library'))
-            library_menu.connect('activate', self._go_library_cb)
+            library_menu.connect('clicked', self._go_library_cb)
             menu_box.append_item(library_menu)
 
-        menu_box.show_all()
+        menu_box.show()
 
         # verify if the home page is configured
         home_page = tabbed_view.settings.get_string(SETTINGS_KEY_HOME_PAGE)
         self._reset_home_menu.set_visible(home_page != '')
 
-        toolbar.insert(self._go_home, -1)
+        toolbar.append(self._go_home)
         self._go_home.show()
 
         self.entry = WebEntry()
@@ -395,22 +444,27 @@ class PrimaryToolbar(ToolbarBase):
                                       'entry-stop')
         self.entry.connect('icon-press', self._stop_and_reload_cb)
         self.entry.connect('activate', self._entry_activate_cb)
-        self.entry.connect('focus-in-event', self.__focus_in_event_cb)
-        self.entry.connect('focus-out-event', self.__focus_out_event_cb)
-        self.entry.connect('key-press-event', self.__key_press_event_cb)
+        focus_controller = Gtk.EventControllerFocus()
+        focus_controller.connect('enter', self.__focus_in_event_cb)
+        focus_controller.connect('leave', self.__focus_out_event_cb)
+        self.entry.add_controller(focus_controller)
+
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect('key-pressed', self.__key_press_event_cb)
+        self.entry.add_controller(key_controller)
         self.entry.connect('changed', self.__changed_cb)
 
         # In an event box so that it can render the background
-        entry_box = Gtk.EventBox()
-        entry_box.add(self.entry)
+        entry_box = Gtk.Box()
+        entry_box.append(self.entry)
         entry_box.show()
 
-        self._entry_item = Gtk.ToolItem()
-        self._entry_item.set_expand(True)
-        self._entry_item.add(entry_box)
+        self._entry_item = Gtk.Box()
+        self._entry_item.set_hexpand(True)
+        self._entry_item.append(entry_box)
         self.entry.show()
 
-        toolbar.insert(self._entry_item, -1)
+        toolbar.append(self._entry_item)
 
         self._entry_item.show()
 
@@ -419,35 +473,41 @@ class PrimaryToolbar(ToolbarBase):
         self._back.set_tooltip(_('Back'))
         self._back.props.sensitive = False
         self._back.connect('clicked', self._go_back_cb)
-        toolbar.insert(self._back, -1)
+        toolbar.append(self._back)
         self._back.show()
 
         palette = self._back.get_palette()
-        self._back_box_menu = Gtk.VBox()
+        self._back_box_menu = PaletteMenuBox()
         self._back_box_menu.show()
         palette.set_content(self._back_box_menu)
         # FIXME, this is a hack, should be done in the theme:
-        palette._content.set_border_width(1)
+        palette._content.set_margin_start(1)
+        palette._content.set_margin_end(1)
+        palette._content.set_margin_top(1)
+        palette._content.set_margin_bottom(1)
 
         self._forward = ToolButton('go-next-paired',
                                    accelerator='<ctrl>Right')
         self._forward.set_tooltip(_('Forward'))
         self._forward.props.sensitive = False
         self._forward.connect('clicked', self._go_forward_cb)
-        toolbar.insert(self._forward, -1)
+        toolbar.append(self._forward)
         self._forward.show()
 
         palette = self._forward.get_palette()
-        self._forward_box_menu = Gtk.VBox()
+        self._forward_box_menu = PaletteMenuBox()
         self._forward_box_menu.show()
         palette.set_content(self._forward_box_menu)
         # FIXME, this is a hack, should be done in the theme:
-        palette._content.set_border_width(1)
+        palette._content.set_margin_start(1)
+        palette._content.set_margin_end(1)
+        palette._content.set_margin_top(1)
+        palette._content.set_margin_bottom(1)
 
         self._download_icon = ProgressToolButton(
             icon_name='emblem-downloads',
             tooltip=_('No Downloads Running'))
-        toolbar.insert(self._download_icon, -1)
+        toolbar.append(self._download_icon)
         self._download_icon.show()
         downloadmanager.connect_download_started(self.__download_started_cb)
 
@@ -456,22 +516,18 @@ class PrimaryToolbar(ToolbarBase):
         self._link_add.set_tooltip(_('Bookmark'))
         self._link_add_toggled_hid = \
             self._link_add.connect('toggled', self.__link_add_toggled_cb)
-        toolbar.insert(self._link_add, -1)
+        toolbar.append(self._link_add)
         self._link_add.show()
 
-        self._toolbar_separator = Gtk.SeparatorToolItem()
-        self._toolbar_separator.props.draw = False
-        self._toolbar_separator.set_expand(True)
+        self._toolbar_separator = Gtk.Box()
+        self._toolbar_separator.set_hexpand(True)
 
         self._stop_button = StopButton(self._activity)
-        toolbar.insert(self._stop_button, -1)
+        toolbar.append(self._stop_button)
 
-        self._progress_listener = None
         self._browser = None
 
-        self._loading_changed_hid = None
         self._progress_changed_hid = None
-        self._session_history_changed_hid = None
         self._uri_changed_hid = None
         self._load_changed_hid = None
         self._security_status_changed_hid = None
@@ -482,10 +538,22 @@ class PrimaryToolbar(ToolbarBase):
         tabbed_view.connect_after('switch-page', self.__switch_page_cb)
         tabbed_view.connect_after('page-added', self.__page_added_cb)
 
-        Gdk.Screen.get_default().connect('size-changed',
-                                         self.__screen_size_changed_cb)
-
         self._configure_toolbar()
+
+    def do_dispose(self):
+        if self._download_running_hid is not None:
+            GLib.source_remove(self._download_running_hid)
+            self._download_running_hid = None
+        if self._browser is not None:
+            if self._uri_changed_hid is not None:
+                self._browser.disconnect(self._uri_changed_hid)
+            if self._load_changed_hid is not None:
+                self._browser.disconnect(self._load_changed_hid)
+            if self._progress_changed_hid is not None:
+                self._browser.disconnect(self._progress_changed_hid)
+            if self._security_status_changed_hid is not None:
+                self._browser.disconnect(self._security_status_changed_hid)
+        super().do_dispose()
 
     def __download_started_cb(self):
         if self._download_running_hid is None:
@@ -504,58 +572,82 @@ class PrimaryToolbar(ToolbarBase):
             self._download_icon.props.tooltip = _('No Downloads Running')
             return False
 
-    def __key_press_event_cb(self, entry, event):
-        self._tabbed_view.current_browser.loading_uri = entry.props.text
+    def __key_press_event_cb(self, controller, keyval, keycode, state):
+        entry = controller.get_widget()
+        browser = self._tabbed_view.current_browser
+        # DummyBrowser (used for PDFs) does not have a loading_uri attribute
+        if hasattr(browser, 'loading_uri'):
+            browser.loading_uri = entry.props.text
 
     def __switch_page_cb(self, tabbed_view, page, page_num):
         if tabbed_view.get_n_pages():
             self._connect_to_browser(tabbed_view.props.current_browser)
 
     def __page_added_cb(self, notebook, child, pagenum):
-        self.entry._search_popdown()
+        self.entry.search_popdown()
 
-    def _configure_toolbar(self, screen=None):
+    def _configure_toolbar(self):
         # Adapt the toolbars for portrait or landscape mode.
 
-        if screen is None:
-            screen = Gdk.Screen.get_default()
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
 
-        if screen.get_width() < screen.get_height():
-            if self._entry_item in self._url_toolbar.toolbar.get_children():
+        monitors = display.get_monitors()
+        if monitors.get_n_items() > 0:
+            geom = monitors.get_item(0).get_geometry()
+            width, height = geom.width, geom.height
+        else:
+            # Fallback landscape dimensions for headless tests or early
+            # initialization
+            width, height = 1200, 900
+
+        if width < height:
+            if self._entry_item.get_parent() == self._url_toolbar.toolbar:
                 return
 
             self.toolbar.remove(self._entry_item)
-            self._url_toolbar.toolbar.insert(self._entry_item, -1)
+            self._url_toolbar.toolbar.append(self._entry_item)
 
-            separator_pos = len(self.toolbar.get_children()) - 1
-            self.toolbar.insert(self._toolbar_separator, separator_pos)
+            self.toolbar.insert_child_after(
+                self._toolbar_separator, self._link_add)
             self._toolbar_separator.show()
 
-            self.pack_end(self._url_toolbar, True, True, 0)
+            self.append(self._url_toolbar)
+            self._url_toolbar.set_hexpand(True)
             self._url_toolbar.show()
 
         else:
-            if self._entry_item in self.toolbar.get_children():
+            if self._entry_item.get_parent() == self.toolbar:
                 return
 
             self.toolbar.remove(self._toolbar_separator)
 
-            position = len(self.toolbar.get_children()) - 4
             self._url_toolbar.toolbar.remove(self._entry_item)
-            self.toolbar.insert(self._entry_item, position)
+            self.toolbar.insert_child_after(self._entry_item, self._go_home)
 
             self._toolbar_separator.hide()
             self.remove(self._url_toolbar)
 
-    def __screen_size_changed_cb(self, screen):
-        self._configure_toolbar(screen)
+    def do_size_allocate(self, width, height, baseline):
+        super().do_size_allocate(width, height, baseline)
+        if not self._configuring_toolbar:
+            self._configuring_toolbar = True
+            try:
+                self._configure_toolbar()
+            finally:
+                self._configuring_toolbar = False
 
     def _connect_to_browser(self, browser):
         if self._browser is not None:
-            self._browser.disconnect(self._uri_changed_hid)
-            self._browser.disconnect(self._load_changed_hid)
-            self._browser.disconnect(self._progress_changed_hid)
-            self._browser.disconnect(self._security_status_changed_hid)
+            if self._uri_changed_hid is not None:
+                self._browser.disconnect(self._uri_changed_hid)
+            if self._load_changed_hid is not None:
+                self._browser.disconnect(self._load_changed_hid)
+            if self._progress_changed_hid is not None:
+                self._browser.disconnect(self._progress_changed_hid)
+            if self._security_status_changed_hid is not None:
+                self._browser.disconnect(self._security_status_changed_hid)
 
         self._browser = browser
         if not isinstance(self._browser, DummyBrowser):
@@ -592,8 +684,10 @@ class PrimaryToolbar(ToolbarBase):
         # Display security status as a lock icon in the left side of
         # the URL entry.
         if security_status is None:
-            self.entry.set_icon_from_pixbuf(
-                iconentry.ICON_ENTRY_PRIMARY, None)
+            # sugar4 iconentry uses remove_icon() instead of
+            # set_icon_from_pixbuf(..., None)
+            self.entry.remove_icon(
+                iconentry.ICON_ENTRY_PRIMARY)
         elif security_status == Browser.SECURITY_STATUS_SECURE:
             self.entry.set_icon_from_name(
                 iconentry.ICON_ENTRY_PRIMARY, 'channel-secure-symbolic')
@@ -623,14 +717,14 @@ class PrimaryToolbar(ToolbarBase):
             else:
                 self._show_clear_icon()
 
-    def __focus_in_event_cb(self, entry, event):
+    def __focus_in_event_cb(self, controller):
         if not self._tabbed_view.is_current_page_pdf():
             if not self.entry.props.text:
                 self._show_no_icon()
             else:
                 self._show_clear_icon()
 
-    def __focus_out_event_cb(self, entry, event):
+    def __focus_out_event_cb(self, controller):
         if self._loading:
             self._show_stop_icon()
         else:
@@ -676,6 +770,9 @@ class PrimaryToolbar(ToolbarBase):
         self._update_navigation_buttons()
 
     def _entry_activate_cb(self, entry):
+        if not isinstance(self._browser, Browser):
+            return
+
         url = entry.props.text
         effective_url = self._tabbed_view.normalize_or_autosearch_url(url)
         self._browser.load_uri(effective_url)
@@ -711,7 +808,9 @@ class PrimaryToolbar(ToolbarBase):
     def __load_changed_cb(self, widget, event):
         self._update_navigation_buttons()
 
-    def _stop_and_reload_cb(self, entry, icon_pos, button):
+    def _stop_and_reload_cb(self, entry, icon_pos):
+        # Gtk.Entry::icon-press signature does not have a button parameter
+        # (handled by gestures internally)
         if entry.has_focus() and \
                 not self._tabbed_view.is_current_page_pdf():
             entry.set_text('')
@@ -735,25 +834,31 @@ class PrimaryToolbar(ToolbarBase):
                 self._show_no_icon()
 
     def _set_sensitive(self, value):
-        for widget in self.toolbar:
+        widget = self.toolbar.get_first_child()
+        while widget:
             if widget not in (self._stop_button,
                               self._link_add):
                 widget.set_sensitive(value)
+            widget = widget.get_next_sibling()
 
     def _reload_session_history(self):
         back_forward_list = self._browser.get_back_forward_list()
-        item_index = 0  # The index of the history item
 
         # Clear menus in palettes:
         for box_menu in (self._back_box_menu, self._forward_box_menu):
-            for menu_item in box_menu.get_children():
-                box_menu.remove(menu_item)
+            while True:
+                child = box_menu.get_first_child()
+                if not child:
+                    break
+                box_menu.remove(child)
 
         def create_menu_item(history_item):
             """Create a MenuItem for the back or forward palettes."""
             title = history_item.get_title() or _('No Title')
-            menu_item = PaletteMenuItem(text_label=title)
-            menu_item.connect('activate', self._history_item_activated_cb,
+            # Use set_label() because text_label= in constructor throws a TypeError
+            menu_item = PaletteMenuItem()
+            menu_item.set_label(title)
+            menu_item.connect('clicked', self._history_item_activated_cb,
                               history_item)
             return menu_item
 
@@ -762,26 +867,19 @@ class PrimaryToolbar(ToolbarBase):
         back_list.reverse()
         for item in back_list:
             menu_item = create_menu_item(item)
-            self._back_box_menu.pack_end(menu_item, False, False, 0)
+            self._back_box_menu.append_item(menu_item)
             menu_item.show()
-            item_index += 1
-
-        # Increment the item index to count the current page:
-        item_index += 1
 
         forward_list = back_forward_list.get_forward_list_with_limit(
             _MAX_HISTORY_ENTRIES)
-        forward_list.reverse()
         for item in forward_list:
             menu_item = create_menu_item(item)
-            self._forward_box_menu.pack_start(menu_item, False, False, 0)
+            self._forward_box_menu.append_item(menu_item)
             menu_item.show()
-            item_index += 1
 
     def _history_item_activated_cb(self, menu_item, history_item):
         self._back.get_palette().popdown(immediate=True)
         self._forward.get_palette().popdown(immediate=True)
-        # self._browser.set_history_index(index)
         self._browser.go_to_back_forward_list_item(history_item)
 
     def __link_add_toggled_cb(self, button):
@@ -792,24 +890,29 @@ class PrimaryToolbar(ToolbarBase):
 
     def inspect_view(self, button):
         page = self._canvas.get_current_page()
-        webview = self._canvas.get_children()[page].props.browser
+        webview = self._canvas.get_nth_page(page).props.browser
 
         # If get_inspector returns None, it is not a real WebView
         inspector = webview.get_inspector()
         if inspector is not None:
             # Inspector window will be blank if disabled
             web_settings = webview.get_settings()
-            web_settings.props.enable_developer_extras = True
+            try:
+                web_settings.props.enable_developer_extras = True
+            except AttributeError:
+                logging.warning(
+                    "WebKit settings missing enable_developer_extras; "
+                    "web inspector may be blank.")
 
             inspector.show()
             inspector.attach()
 
     '''
-    import sugar3.profile
-    from sugar3.datastore import datastore
-    from sugar3.activity import activity
-    from sugar3.graphics.alert import Alert
-    from sugar3.graphics.icon import Icon
+    import sugar4.profile
+    from sugar4.datastore import datastore
+    from sugar4.activity import activity
+    from sugar4.graphics.alert import Alert
+    from sugar4.graphics.icon import Icon
     import tempfile
 
     def save_as_pdf(self, widget):
@@ -818,13 +921,16 @@ class PrimaryToolbar(ToolbarBase):
         os.close(fd)
 
         page = self._canvas.get_current_page()
-        webview = self._canvas.get_children()[page].get_children()[0]
+        # The Browser widget is the page itself, or you can use
+        # get_first_child if it's wrapped
+        webview = self._canvas.get_nth_page(page).get_first_child()
         webview.connect('print', self.__pdf_print_cb, file_path)
         # Why is there no webview method to do this?
-        webview.run_javascript('window.print()', None, None)
+        webview.evaluate_javascript(
+            'window.print()', -1, None, None, None, None, None)
 
     def __pdf_print_cb(self, webview, wk_print, file_path):
-        webkit.dicsonnect_by_func(self.__pdf_print_cb)
+        webview.disconnect_by_func(self.__pdf_print_cb)
 
         settings = wk_print.get_settings()
         settings.set(Gtk.PRINT_SETTINGS_OUTPUT_FILE_FORMAT, 'PDF')
@@ -833,7 +939,7 @@ class PrimaryToolbar(ToolbarBase):
         # get lost in the python bindings since it conflicts with the keyword
         wk_print.print()
 
-        color = sugar3.profile.get_color().to_string()
+        color = sugar4.profile.get_color().to_string()
         try:
             jobject.metadata['title'] = _('Browse activity as PDF')
             jobject.metadata['icon-color'] = color
@@ -862,7 +968,7 @@ class PrimaryToolbar(ToolbarBase):
 
         self._activity.add_alert(alert)
         alert.connect('response', self.__pdf_response_alert, object_id)
-        alert.show_all()
+        alert.show()
 
     def __pdf_response_alert(self, alert, response_id, object_id):
 

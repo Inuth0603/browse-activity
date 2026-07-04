@@ -20,16 +20,16 @@ from gettext import gettext as _
 from gi.repository import Gtk
 from gi.repository import GObject
 
-from sugar3.graphics.toolbutton import ToolButton
-from sugar3.graphics.toggletoolbutton import ToggleToolButton
+from sugar4.graphics.toolbutton import ToolButton
+from sugar4.graphics.toggletoolbutton import ToggleToolButton
 
 from browser import Browser
 from browser import ZOOM_ORIGINAL
 
 
-class ViewToolbar(Gtk.Toolbar):
+class ViewToolbar(Gtk.Box):
     def __init__(self, activity):
-        GObject.GObject.__init__(self)
+        Gtk.Box.__init__(self, orientation=Gtk.Orientation.HORIZONTAL)
 
         self._browser = None
 
@@ -38,30 +38,29 @@ class ViewToolbar(Gtk.Toolbar):
         self.zoomout = ToolButton('zoom-out', accelerator='<ctrl>minus')
         self.zoomout.set_tooltip(_('Zoom out'))
         self.zoomout.connect('clicked', self.__zoomout_clicked_cb)
-        self.insert(self.zoomout, -1)
+        self.append(self.zoomout)
         self.zoomout.show()
 
         self.zoomin = ToolButton('zoom-in', accelerator='<ctrl>plus')
         self.zoomin.set_tooltip(_('Zoom in'))
         self.zoomin.connect('clicked', self.__zoomin_clicked_cb)
-        self.insert(self.zoomin, -1)
+        self.append(self.zoomin)
         self.zoomin.show()
 
         self.zoom_original = ToolButton('zoom-original', accelerator='<ctrl>0')
         self.zoom_original.set_tooltip(_('Actual size'))
         self.zoom_original.connect('clicked', self.__zoom_original_clicked_cb)
-        self.insert(self.zoom_original, -1)
+        self.append(self.zoom_original)
         self.zoom_original.show()
 
-        self.separator = Gtk.SeparatorToolItem()
-        self.separator.set_draw(True)
-        self.insert(self.separator, -1)
+        self.separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        self.append(self.separator)
         self.separator.show()
 
         self.fullscreen = ToolButton('view-fullscreen')
         self.fullscreen.set_tooltip(_('Fullscreen'))
         self.fullscreen.connect('clicked', self.__fullscreen_clicked_cb)
-        self.insert(self.fullscreen, -1)
+        self.append(self.fullscreen)
         self.fullscreen.show()
 
         self.traybutton = ToggleToolButton('tray-show')
@@ -69,7 +68,7 @@ class ViewToolbar(Gtk.Toolbar):
         self.traybutton.connect('toggled', self.__tray_toggled_cb)
         self.traybutton.props.sensitive = False
         self.traybutton.props.active = False
-        self.insert(self.traybutton, -1)
+        self.append(self.traybutton)
         self.traybutton.show()
 
         tabbed_view = self._activity.get_canvas()
